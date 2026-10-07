@@ -1,0 +1,11 @@
+[Unit]
+Description=Netwatch hotspot: new day of usage at midnight
+
+[Timer]
+OnCalendar=*-*-* 00:00:05
+AccuracySec=1s
+# missed it (the computer was off at midnight)? run at the next boot
+Persistent=true
+
+[Install]
+WantedBy=timers.target

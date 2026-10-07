@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Lets the Netwatch window start its root helper through pkexec.
+     auth_admin_keep: the password is asked once and remembered for a few minutes. -->
+<policyconfig>
+  <vendor>Netwatch</vendor>
+  <action id="local.netwatch.Netwatch.capture">
+    <description>Measure network usage per application</description>
+    <message>Netwatch needs administrator rights to see which applications are using the network</message>
+    <icon_name>local.netwatch.Netwatch</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/netwatch/netwatch-helper</annotate>
+  </action>
+</policyconfig>

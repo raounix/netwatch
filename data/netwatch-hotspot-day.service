@@ -1,0 +1,15 @@
+# Started by netwatch-hotspot-day.timer: files the day's hotspot usage away and
+# starts the counters and daily limits from zero.
+[Unit]
+Description=Netwatch hotspot: start a new day of usage
+After=netwatch-hotspot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/netwatch/netwatch-helper --new-day
+StateDirectory=netwatch
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

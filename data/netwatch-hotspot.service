@@ -1,0 +1,22 @@
+# Netwatch hotspot limits: put the nftables table back at boot (with the day's
+# usage so far), and save the day's usage at shutdown.
+[Unit]
+Description=Netwatch hotspot limits and daily usage
+After=nftables.service
+# nftables.service loads /etc/nftables.conf, which usually starts with
+# "flush ruleset" — run after it, or the table would be wiped right away.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/netwatch/netwatch-helper --restore
+ExecStop=/usr/local/lib/netwatch/netwatch-helper --save-usage
+StateDirectory=netwatch
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

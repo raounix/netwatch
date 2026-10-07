@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Netwatch
+GenericName=Network Monitor
+Comment=See which applications are using the network right now
+Exec=netwatch
+Icon=local.netwatch.Netwatch
+Terminal=false
+Categories=Network;Monitor;GTK;
+Keywords=network;bandwidth;traffic;download;upload;usage;speed;
+StartupNotify=true

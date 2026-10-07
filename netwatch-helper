@@ -1,0 +1,1879 @@
+#!/usr/bin/python3 -I
+# netwatch-helper — which program is using the network, measured from packets.
+#
+# Runs as root. The Netwatch window starts it through pkexec; `sudo netwatch-top`
+# runs it in a terminal. It never writes a file and never starts another
+# program: it reads /proc and /sys, keeps one TPACKET_V2 ring per network
+# interface that holds only the first ~440 bytes of every packet (the headers;
+# payload is never copied out of the kernel), and prints one report per
+# interval on stdout.
+#
+# How a packet turns into "Google Chrome  ↓ 1.2 MB/s":
+#   packet headers → (protocol, local ip:port, remote ip:port)
+#   → socket inode    /proc/net/{tcp,tcp6,udp,udp6}
+#   → process         the socket:[inode] links under /proc/<pid>/fd
+#   → application     the process's systemd unit, e.g. app-gnome-google\x2dchrome-4242.scope
+#
+# --json prints one JSON object per line (what the window reads); --text
+# redraws a table, and is the default when stdout is a terminal.
+
+import argparse
+import binascii
+import fcntl
+import ipaddress
+import json
+import mmap
+import os
+import pwd
+import re
+import select
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+PROTOCOL = 1                     # bump whenever the JSON shape changes
+
+# ── packet capture ──────────────────────────────────────────────────────────
+SOL_PACKET = 263
+PACKET_RX_RING = 5
+PACKET_STATISTICS = 6
+PACKET_VERSION = 10
+TPACKET_V2 = 1
+TP_STATUS_USER = 1
+PACKET_OTHERHOST = 3             # someone else's packet, seen only in promiscuous mode
+PACKET_OUTGOING = 4
+ETH_P_ALL = 0x0003
+
+FRAME_SIZE = 512                 # one slot per packet: 66 bytes of ring header + ~446 of packet
+BLOCK_SIZE = 1 << 16
+BLOCK_NR = 128                   # 8 MiB per interface = 16384 packets of headroom
+FRAMES = BLOCK_SIZE // FRAME_SIZE * BLOCK_NR
+FRAME_HDR = struct.Struct("<IIIHH")   # tpacket2_hdr: status, len, snaplen, mac, net
+SLL_PKTTYPE = 32 + 10            # sockaddr_ll sits right after the 32-byte tpacket2_hdr
+RELEASE = bytes(4)               # TP_STATUS_KERNEL: hand the slot back
+
+UNATTRIBUTED = 0                 # pseudo-pids for traffic no process owns
+OTHER_PROTOCOLS = -1
+HOTSPOT_DEVICES = -2
+MAX_PENDING = 50_000             # unresolved flows kept per interval (a port scan must not eat memory)
+
+# A brand-new connection is missing from a table read a moment earlier, so the
+# owner of an unknown flow is looked up right after the batch of packets it
+# arrived in — a `curl` or a `git fetch` can start, download and exit in well
+# under a second, and once it is gone nobody can say whose bytes those were.
+# Every new flow of a batch shares one read of the kernel tables, and a token
+# bucket caps the work: at most RESOLVE_SHARE of one core over time, in bursts
+# of up to RESOLVE_BURST seconds after a quiet spell.
+RESOLVE_SHARE = 0.15
+RESOLVE_BURST = 0.05
+RETRY = 0.02                     # a flow that could not be placed is tried again after this
+RETRY_SOON = 0.002               # …or this, when its socket exists but no process lists it yet:
+                                 # accept() shows the new socket in /proc/net/tcp a moment
+                                 # before the fd lands in the process's fd table
+OWNERS_FULL_EVERY = 30.0         # full rebuild, so sockets that closed long ago are forgotten
+HOT_PIDS = 64                    # recently active processes, searched first for a new socket
+
+
+class Ring:
+    """One TPACKET_V2 receive ring bound to one interface."""
+
+    def __init__(self, ifname):
+        self.ifname = ifname
+        self.head = 0
+        # Protocol 0 keeps the socket deaf until bind(), so no packet from some
+        # other interface can land in the ring while it is being set up.
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
+        self.mm = None
+        try:
+            sock.setsockopt(SOL_PACKET, PACKET_VERSION, TPACKET_V2)
+            sock.setsockopt(SOL_PACKET, PACKET_RX_RING,
+                            struct.pack("4I", BLOCK_SIZE, BLOCK_NR, FRAME_SIZE, FRAMES))
+            self.mm = mmap.mmap(sock.fileno(), BLOCK_SIZE * BLOCK_NR,
+                                mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+            sock.bind((ifname, ETH_P_ALL))
+        except BaseException:
+            if self.mm is not None:
+                self.mm.close()
+            sock.close()
+            raise
+        self.sock = sock
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def drops(self):
+        """Packets the kernel had to drop since the last call (reading resets it)."""
+        try:
+            _, dropped = struct.unpack("II", self.sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))
+            return dropped
+        except OSError:
+            return 0
+
+    def close(self):
+        try:
+            self.mm.close()
+        except (BufferError, ValueError):
+            pass
+        self.sock.close()
+
+
+# ── interfaces ──────────────────────────────────────────────────────────────
+def _read(path, limit=4096):
+    try:
+        with open(path, "rb") as f:
+            return f.read(limit)
+    except OSError:
+        return b""
+
+
+def iface_kind(name):
+    """What an interface is, from sysfs. Decides whether its packets are counted:
+    container bridges and their veth ports carry traffic the uplink already
+    carries (after NAT), and loopback is not network traffic at all."""
+    d = "/sys/class/net/" + name
+    if name == "lo" or _read(d + "/type").strip() == b"772":
+        return "loopback"
+    devtype = ""
+    for line in _read(d + "/uevent").splitlines():
+        if line.startswith(b"DEVTYPE="):
+            devtype = line[8:].decode("ascii", "replace")
+    if devtype == "bridge" or os.path.isdir(d + "/bridge"):
+        return "bridge"
+    if os.path.exists(d + "/brport"):
+        return "bridge-port"
+    if devtype in ("vlan", "macvlan", "ipvlan", "macvtap"):
+        return "stacked"         # rides on a physical interface that is captured anyway
+    if os.path.exists(d + "/device"):
+        return "physical"        # ethernet, wifi, USB tethering, a VM's virtio NIC
+    if devtype == "wireguard" or os.path.exists(d + "/tun_flags") \
+            or _read(d + "/type").strip() in (b"65534", b"512"):
+        return "vpn"             # tun/tap, wireguard, ppp
+    return "virtual"
+
+
+def default_route_ifaces():
+    """Interfaces that carry a default route (IPv4 or IPv6): the way out."""
+    out = set()
+    for line in _read("/proc/net/route", 1 << 20).splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 8 and f[1] == b"00000000" and f[7] == b"00000000":
+            out.add(f[0].decode("ascii", "replace"))
+    for line in _read("/proc/net/ipv6_route", 4 << 20).splitlines():
+        f = line.split()
+        if len(f) >= 10 and f[0] == b"0" * 32 and f[1] == b"00":
+            out.add(f[9].decode("ascii", "replace"))
+    out.discard("lo")
+    return out
+
+
+def read_dev_counters():
+    """Kernel byte counters per interface (exact, unlike a packet capture)."""
+    out = {}
+    for line in _read("/proc/net/dev", 1 << 20).splitlines()[2:]:
+        name, _, rest = line.partition(b":")
+        f = rest.split()
+        if len(f) >= 9:
+            out[name.strip().decode("ascii", "replace")] = (int(f[0]), int(f[8]))
+    return out
+
+
+# ── kernel socket tables ────────────────────────────────────────────────────
+ANY4 = bytes(4)
+ANY6 = bytes(16)
+V4MAPPED = bytes(10) + b"\xff\xff"
+LITTLE = sys.byteorder == "little"
+
+
+def _addr(field, cache):
+    """'0100007F:1F90' → (b'\\x7f\\x00\\x00\\x01', 8080). The kernel prints each
+    32-bit word of the address in host byte order. IPv4-mapped IPv6 addresses
+    become plain IPv4, so a dual-stack socket matches IPv4 packets."""
+    hexip, _, hexport = field.partition(b":")
+    ip = cache.get(hexip)
+    if ip is None:
+        raw = binascii.unhexlify(hexip)
+        if LITTLE:
+            raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+        if len(raw) == 16 and raw[:12] == V4MAPPED:
+            raw = raw[12:]
+        ip = cache[hexip] = raw
+    return ip, int(hexport, 16)
+
+
+TCP4, TCP6, UDP4, UDP6 = "/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"
+
+
+class SocketTable:
+    """(protocol, local, remote) → socket inode, from /proc/net/{tcp,udp}{,6}.
+
+    Each file is kept on its own so a lookup re-reads only what it needs: an
+    IPv6 flow only tcp6/udp6, an IPv4 flow the IPv4 file plus the IPv6 one
+    (dual-stack sockets carry IPv4 traffic as ::ffff:a.b.c.d)."""
+
+    def __init__(self):
+        self.conn = {path: {} for path in (TCP4, TCP6, UDP4, UDP6)}   # (lip, lport, rip, rport) → inode
+        self.bound = {path: {} for path in (TCP4, TCP6, UDP4, UDP6)}  # (lip, lport) → inode: TCP listeners, UDP sockets
+        self._ipcache = {}
+
+    @staticmethod
+    def files(flow):
+        if flow[0] == 6:
+            return (TCP4, TCP6) if len(flow[1]) == 4 else (TCP6,)
+        return (UDP4, UDP6) if len(flow[1]) == 4 else (UDP6,)
+
+    def refresh(self, paths=(TCP4, TCP6, UDP4, UDP6)):
+        cache = self._ipcache
+        if len(cache) > 20_000:
+            cache.clear()
+        for path in paths:
+            tcp = path in (TCP4, TCP6)
+            conn, bound = {}, {}
+            for line in _read(path, 64 << 20).splitlines()[1:]:
+                f = line.split()
+                if len(f) < 10:
+                    continue
+                inode = int(f[9])
+                if not inode:
+                    continue     # TIME_WAIT and friends: no process holds them any more
+                lip, lport = _addr(f[1], cache)
+                rip, rport = _addr(f[2], cache)
+                if tcp:
+                    if f[3] == b"0A":
+                        bound[(lip, lport)] = inode
+                    else:
+                        conn[(lip, lport, rip, rport)] = inode
+                else:
+                    bound.setdefault((lip, lport), inode)
+                    if rport:
+                        conn[(lip, lport, rip, rport)] = inode
+            self.conn[path], self.bound[path] = conn, bound
+
+    def _bound(self, paths, lip, lport):
+        for path in paths:
+            t = self.bound[path]
+            inode = t.get((lip, lport)) or (t.get((ANY4, lport)) if len(lip) == 4 else 0) \
+                or t.get((ANY6, lport))
+            if inode:
+                return inode
+        return 0
+
+    def listener(self, flow):
+        """The listening socket an incoming TCP connection was accepted from."""
+        return self._bound(self.files(flow), flow[1], flow[2]) if flow[0] == 6 else 0
+
+    def lookup(self, flow):
+        _, lip, lport, rip, rport = flow
+        paths = self.files(flow)
+        for path in paths:
+            inode = self.conn[path].get((lip, lport, rip, rport))
+            if inode:
+                return inode
+        return self._bound(paths, lip, lport)
+
+
+def scan_owners(owners, wanted=None, first=()):
+    """Fill socket inode → pid from the socket:[inode] links in /proc/<pid>/fd.
+    With `wanted`, stop as soon as all of those are found, looking first at
+    `first` (processes that were just moving data — a browser opening one more
+    connection) and then at the newest pids (a command that just started)."""
+    try:
+        pids = sorted((int(n) for n in os.listdir("/proc") if n.isdigit()), reverse=True)
+    except OSError:
+        return
+    missing = set(wanted) if wanted else None
+    if missing is not None and first:
+        head = [pid for pid in first if pid > 0]
+        seen = set(head)
+        pids = head + [pid for pid in pids if pid not in seen]
+    for pid in pids:
+        d = "/proc/%d/fd/" % pid
+        try:
+            fds = os.listdir(d)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(d + fd)
+            except OSError:
+                continue
+            if target.startswith("socket:["):
+                inode = int(target[8:-1])
+                prev = owners.get(inode)
+                # Forked children share sockets: keep the parent. But not pid 1 —
+                # with socket activation systemd holds the listener too, and the
+                # traffic is the service's, not systemd's.
+                if prev is None or prev == 1 or (pid < prev and pid != 1):
+                    owners[inode] = pid
+                if missing is not None:
+                    missing.discard(inode)
+        if missing is not None and not missing:
+            return
+
+
+# ── processes → applications ────────────────────────────────────────────────
+SHELLS = frozenset(("bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "tcsh", "csh", "ash",
+                    "nu", "xonsh", "pwsh", "elvish", "busybox"))
+LAUNCHERS = frozenset(("gnome", "flatpak", "kde", "xfce", "dbus", "systemd", "cinnamon", "mate",
+                       "budgie", "lxqt", "sway", "hyprland", "niri", "cosmic"))
+SCOPE_RANDOM = re.compile(r"[0-9]+|[0-9a-f]{8,}")
+SNAP_UNIT = re.compile(r"snap\.([^.]+)\.(.+?)(?:-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?\.(scope|service)")
+DOCKER_UNIT = re.compile(r"docker-([0-9a-f]{64})\.scope")
+INTERPRETER = re.compile(r"(python[0-9.]*|node|nodejs|bun|deno|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*)")
+SYSTEMD_ESCAPE = re.compile(r"\\x([0-9a-fA-F]{2})")
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+SCRIPT_ALIASES = {"npm-cli": "npm", "npx-cli": "npx", "yarn-cli": "yarn", "pnpm-cli": "pnpm"}
+
+# What a system service is doing on the network — these are the usual answer to
+# "something is downloading and I didn't start anything".
+SERVICE_INFO = {
+    "snapd": "Snap store — installs and automatic snap refreshes",
+    "packagekit": "Software updates (PackageKit)",
+    "apt-daily": "Automatic package list update",
+    "apt-daily-upgrade": "Automatic package upgrade",
+    "unattended-upgrades": "Automatic security upgrades",
+    "fwupd": "Firmware updates",
+    "fwupd-refresh": "Firmware update metadata",
+    "docker": "Docker engine — image pulls and pushes",
+    "containerd": "Container runtime — image downloads",
+    "systemd-resolved": "DNS lookups for the whole system",
+    "NetworkManager": "Network connection manager",
+    "systemd-networkd": "Network configuration",
+    "systemd-timesyncd": "Clock synchronisation",
+    "chrony": "Clock synchronisation",
+    "chronyd": "Clock synchronisation",
+    "avahi-daemon": "Local network discovery (mDNS)",
+    "cups-browsed": "Network printer discovery",
+    "cups": "Printing",
+    "ModemManager": "Mobile broadband",
+    "motd-news": "Ubuntu message-of-the-day news",
+    "ubuntu-advantage": "Ubuntu Pro",
+    "update-notifier-download": "Update notifier",
+    "whoopsie": "Ubuntu error reporting",
+    "apport": "Crash reporting",
+    "tailscaled": "Tailscale VPN",
+    "geoclue": "Location service",
+    "ssh": "SSH server",
+    "sshd": "SSH server",
+    "systemd": "systemd",
+}
+USER_SERVICE_INFO = {
+    "gnome-software": "GNOME Software — update checks and downloads",
+    "evolution-source-registry": "Online accounts (mail / calendar sync)",
+    "evolution-calendar-factory": "Calendar sync",
+    "goa-daemon": "Online accounts",
+    "xdg-desktop-portal": "Desktop portal",
+    "tracker-miner-fs-3": "File indexer",
+    "gvfs-daemon": "Network file access (GVfs)",
+    "gvfs-goa-volume-monitor": "Online accounts drives",
+    "snap.snapd-desktop-integration.snapd-desktop-integration": "Snap desktop integration",
+}
+
+
+def clean(text, limit=300):
+    """Strip control characters: process names and command lines are written by
+    whoever started the process, and they end up in root's terminal. Also turn
+    the lone surrogates os.readlink() uses for undecodable bytes into '?', so
+    every string sent is valid UTF-8."""
+    text = CONTROL.sub("?", text.encode("utf-8", "replace").decode("utf-8"))
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _unescape(unit):
+    return SYSTEMD_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), unit)
+
+
+def program_label(comm, exe, argv):
+    """'node /usr/lib/node_modules/npm/bin/npm-cli.js install' → 'npm'."""
+    base = os.path.basename(exe) if exe else comm
+    if base.endswith(" (deleted)"):
+        base = base[:-10]
+    if not base:
+        base = comm or "?"
+    if INTERPRETER.fullmatch(base) and len(argv) > 1:
+        args = argv[1:]
+        if "-c" in args or "-e" in args:
+            return base
+        if "-m" in args and args.index("-m") + 1 < len(args):
+            return args[args.index("-m") + 1]
+        for a in args:
+            if a.startswith("-"):
+                continue
+            name = os.path.basename(a)
+            for ext in (".js", ".mjs", ".cjs", ".ts", ".py", ".rb", ".pl", ".php"):
+                if name.endswith(ext):
+                    name = name[:-len(ext)]
+                    break
+            return SCRIPT_ALIASES.get(name, name) or base
+    return base
+
+
+class Proc:
+    __slots__ = ("pid", "start", "comm", "cmd", "user", "app", "via")    # start: clock ticks since boot
+
+
+class ProcCache:
+    """pid → what the process is and which application it belongs to.
+    Entries are keyed on the start time too, so a recycled pid is not mistaken
+    for the process that had it before."""
+
+    def __init__(self):
+        self.by_pid = {}
+        self.apps = {}           # application key → description sent to the window
+        self._users = {}
+        self._containers = {}
+
+    def get(self, pid):
+        start = self._start(pid)
+        cached = self.by_pid.get(pid)
+        if start is None or (cached is not None and cached.start == start):
+            return cached        # exited: keep what was known while it ran
+        p = self._load(pid, start)
+        if p is not None:
+            self.by_pid[pid] = p
+        return p
+
+    def prune(self):
+        """Keep the caches bounded: anyone can start processes with any name,
+        and this runs as root for as long as the window is open."""
+        if len(self.by_pid) > 4096:
+            self.by_pid = {pid: p for pid, p in self.by_pid.items() if self._start(pid) == p.start}
+        if len(self.apps) > 1024:
+            used = {p.app for p in self.by_pid.values()}
+            self.apps = {k: v for k, v in self.apps.items() if k in used}
+        if len(self._containers) > 256:
+            self._containers = {}
+
+    @staticmethod
+    def _stat(pid):
+        raw = _read("/proc/%d/stat" % pid)
+        i = raw.rfind(b")")      # comm may contain spaces and parentheses
+        return raw[i + 2:].split() if i > 0 else None
+
+    def _start(self, pid):
+        f = self._stat(pid)
+        return int(f[19]) if f and len(f) > 19 else None
+
+    def _ppid(self, pid):
+        f = self._stat(pid)
+        return int(f[1]) if f and len(f) > 1 else 0
+
+    @staticmethod
+    def _cgroup(pid):
+        for line in _read("/proc/%d/cgroup" % pid).splitlines():
+            if line.startswith(b"0::"):
+                return line[3:].decode("utf-8", "replace")
+        return ""
+
+    @staticmethod
+    def _comm(pid):
+        return _read("/proc/%d/comm" % pid).rstrip(b"\n").decode("utf-8", "replace")
+
+    def _user(self, uid):
+        name = self._users.get(uid)
+        if name is None:
+            try:
+                name = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                name = str(uid)
+            self._users[uid] = name
+        return name
+
+    def _container(self, cid):
+        name = self._containers.get(cid)
+        if name is None:
+            name = cid[:12]
+            try:
+                with open("/var/lib/docker/containers/%s/config.v2.json" % cid, "rb") as f:
+                    found = json.loads(f.read(8 << 20)).get("Name")
+                if isinstance(found, str) and found.strip("/"):
+                    name = clean(found.strip("/"), 80)
+            except (OSError, ValueError, AttributeError):
+                pass
+            self._containers[cid] = name
+        return name
+
+    def _shell_ancestor(self, pid, cgroup):
+        """True when the process was typed into a shell inside the same
+        application — an IDE's or a terminal's built-in terminal."""
+        p = self._ppid(pid)
+        for _ in range(32):
+            if p <= 1 or self._cgroup(p) != cgroup:
+                return False
+            if self._comm(p) in SHELLS:
+                return True
+            p = self._ppid(p)
+        return False
+
+    def _load(self, pid, start):
+        comm = self._comm(pid)
+        if not comm:
+            return None
+        try:
+            exe = os.readlink("/proc/%d/exe" % pid)
+        except OSError:
+            exe = ""
+        argv = [a.decode("utf-8", "replace") for a in _read("/proc/%d/cmdline" % pid, 8192).split(b"\0") if a]
+        try:
+            uid = os.stat("/proc/%d" % pid).st_uid
+        except OSError:
+            return None
+        cgroup = self._cgroup(pid)
+
+        p = Proc()
+        p.pid, p.start = pid, start
+        # comm is cut at 15 characters ("telegram-deskto"); the executable's
+        # name is the whole thing, when it is the same program
+        base = os.path.basename(exe[:-10] if exe.endswith(" (deleted)") else exe)
+        p.comm = clean(base if len(comm) == 15 and base.startswith(comm) else comm, 64)
+        p.cmd = clean(" ".join(argv) or "[%s]" % comm)
+        p.user = self._user(uid)
+        p.via = None
+        p.app = self._classify(pid, uid, cgroup, comm, exe, argv, p)
+        return p
+
+    def _app(self, key, kind, label, app_id=None, desc=None):
+        if key not in self.apps:
+            self.apps[key] = {"kind": kind, "label": clean(label, 120), "app_id": app_id,
+                              "desc": desc}
+        return key
+
+    def _classify(self, pid, uid, cgroup, comm, exe, argv, p):
+        parts = [x for x in cgroup.split("/") if x]
+        leaf = parts[-1] if parts else ""
+        program = clean(program_label(comm, exe, argv), 80)
+
+        def as_process():
+            return self._app("proc:%d:%s" % (uid, program), "process", program)
+
+        if comm in SHELLS:
+            return as_process()
+
+        m = SNAP_UNIT.fullmatch(leaf)
+        if m:
+            snap, app, unit = m.groups()
+            if unit == "service":
+                label = snap if snap == app else "%s (%s)" % (snap, app)
+                if any(x.startswith("user@") for x in parts[:-1]):
+                    return self._app("usvc:%d:snap.%s.%s" % (uid, snap, app), "user-service", label,
+                                     desc=USER_SERVICE_INFO.get("snap.%s.%s" % (snap, app), "Snap service"))
+                return self._app("svc:snap.%s.%s" % (snap, app), "service", label,
+                                 desc=SERVICE_INFO.get(snap, "Snap service"))
+            app_id = "%s_%s" % (snap, app)
+            if self._shell_ancestor(pid, cgroup):
+                p.via = app_id
+                return as_process()
+            return self._app("app:" + app_id, "app", snap, app_id)
+
+        m = DOCKER_UNIT.fullmatch(leaf)
+        if m:
+            name = self._container(m.group(1))
+            return self._app("ctr:" + m.group(1)[:12], "container", name,
+                             desc="Docker container")
+
+        if leaf.startswith("app-") and leaf.endswith((".scope", ".service")):
+            body = leaf[4:].rsplit(".", 1)[0].split("@", 1)[0]
+            tokens = body.split("-")         # escaped dashes (\x2d) do not split
+            if len(tokens) > 1 and SCOPE_RANDOM.fullmatch(tokens[-1]):
+                tokens = tokens[:-1]
+            if len(tokens) > 1 and tokens[0] in LAUNCHERS:
+                tokens = tokens[1:]
+            app_id = _unescape("-".join(tokens))
+            if self._shell_ancestor(pid, cgroup):
+                p.via = app_id
+                return as_process()
+            return self._app("app:" + app_id, "app", app_id, app_id)
+
+        if leaf.endswith(".service"):
+            svc = _unescape(leaf[:-8])
+            base = svc.split("@", 1)[0]          # template instances: getty@tty1, org.gnome.Shell@ubuntu
+            if any(x.startswith("user@") for x in parts[:-1]):
+                return self._app("usvc:%d:%s" % (uid, svc), "user-service", base,
+                                 desc=USER_SERVICE_INFO.get(base))
+            return self._app("svc:" + svc, "service", base, desc=SERVICE_INFO.get(base))
+        if leaf == "init.scope":
+            return self._app("svc:systemd", "service", "systemd", desc=SERVICE_INFO["systemd"])
+        # terminal tabs (vte-spawn-*.scope), SSH and TTY logins (session-*.scope), cron, …
+        return as_process()
+
+
+# ── the hotspot ─────────────────────────────────────────────────────────────
+# When this computer shares its connection (GNOME's Wi-Fi Hotspot: a
+# NetworkManager "shared" connection), the devices on it are listed from three
+# places: the Wi-Fi driver over nl80211 (who is associated, signal, link speed,
+# exact byte counters), dnsmasq's DHCP leases (IP address, the name the device
+# gave itself) and the kernel's neighbour table.
+#
+# Their internet use is counted and limited by one nftables table on the forward
+# path. Being in the kernel, it keeps counting and enforcing while the window is
+# closed; netwatch-hotspot.service puts it back at boot and saves the day's
+# usage at shutdown, and netwatch-hotspot-day.timer starts a new day at midnight.
+# Only one helper at a time may change it: the window's helper holds LOCK_FILE
+# for as long as it runs, and the systemd jobs step aside while it does.
+
+STATE_DIR = "/var/lib/netwatch"
+STATE_FILE = STATE_DIR + "/hotspot.json"
+LOCK_FILE = STATE_DIR + "/active.lock"
+NM_LEASES = "/var/lib/NetworkManager/dnsmasq-%s.leases"
+OUI_FILES = ("/usr/share/ieee-data/oui.txt", "/var/lib/ieee-data/oui.txt", "/usr/share/hwdata/oui.txt")
+NFT = next((p for p in ("/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft") if os.access(p, os.X_OK)), None)
+NFT_TABLE = "netwatch"
+MAC_ADDR = re.compile(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}")
+LIMIT_RANGE = (10_000, 10_000_000_000)              # bytes per second a speed limit may be set to
+QUOTA_RANGE = (1_000_000, 100_000_000_000_000)      # bytes a daily data limit may be set to
+HISTORY_DAYS = 14
+FORGET_DEVICE_DAYS = 30
+SAVE_EVERY = 60.0
+
+
+class HotspotError(Exception):
+    pass
+
+
+def _nla(kind, payload):
+    length = 4 + len(payload)
+    return struct.pack("=HH", length, kind) + payload + bytes(((length + 3) & ~3) - length)
+
+
+def _nla_parse(buf):
+    out, i = {}, 0
+    while i + 4 <= len(buf):
+        length, kind = struct.unpack_from("=HH", buf, i)
+        if length < 4 or i + length > len(buf):
+            break
+        out[kind & 0x3FFF] = buf[i + 4:i + length]      # strip NLA_F_NESTED / NLA_F_NET_BYTEORDER
+        i += (length + 3) & ~3
+    return out
+
+
+class Nl80211:
+    """The few nl80211 (Wi-Fi netlink) calls Netwatch needs: which interfaces
+    are access points, who is associated with them, and disconnecting one."""
+
+    CMD_GET_INTERFACE, CMD_GET_STATION, CMD_DEL_STATION = 5, 17, 20
+    ATTR_IFINDEX, ATTR_IFNAME, ATTR_IFTYPE, ATTR_MAC = 3, 4, 5, 6
+    ATTR_STA_INFO, ATTR_WIPHY_FREQ, ATTR_SSID = 21, 38, 52
+    IFTYPE_AP = 3
+    STA_INACTIVE, STA_RX32, STA_TX32, STA_SIGNAL, STA_TX_BITRATE = 1, 2, 3, 7, 8
+    STA_CONNECTED, STA_RX64, STA_TX64 = 16, 23, 24
+    RATE_BITRATE, RATE_BITRATE32 = 1, 5
+
+    def __init__(self):
+        self.sock = None
+        self.family = None
+        self.seq = 0
+        try:
+            sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 16)     # NETLINK_GENERIC
+            sock.settimeout(1.0)
+            sock.bind((0, 0))
+            self.sock = sock
+            reply = self._request(0x10, 3, _nla(2, b"nl80211\0"))          # CTRL_CMD_GETFAMILY
+            self.family = struct.unpack_from("=H", reply[0][1])[0]
+        except (OSError, IndexError, KeyError, struct.error):
+            self.close()
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+        self.sock = None
+
+    def _request(self, family, cmd, payload=b"", dump=False):
+        """Send one request and collect its replies. The kernel sends the data
+        and the ACK as separate datagrams, so read until DONE (dump) or the ACK
+        for *this* sequence number — a reply left behind would otherwise be
+        taken for the answer to the next request."""
+        self.seq = (self.seq + 1) & 0xFFFFFFFF
+        flags = 0x1 | (0x300 if dump else 0x4)          # REQUEST | (DUMP or ACK)
+        body = struct.pack("=BBH", cmd, 1, 0) + payload
+        self.sock.send(struct.pack("=IHHII", 16 + len(body), family, flags, self.seq, 0) + body)
+        msgs = []
+        for _ in range(4096):                           # a dump of thousands of stations is not a thing
+            data = self.sock.recv(1 << 16)
+            i = 0
+            while i + 16 <= len(data):
+                length, kind, _, seq, _ = struct.unpack_from("=IHHII", data, i)
+                if length < 16 or i + length > len(data):
+                    break
+                if seq == self.seq:
+                    if kind == 3:                       # NLMSG_DONE
+                        return msgs
+                    if kind == 2:                       # NLMSG_ERROR: 0 is the ACK
+                        err = struct.unpack_from("=i", data, i + 16)[0]
+                        if err:
+                            raise OSError(-err, os.strerror(-err))
+                        return msgs
+                    msgs.append(_nla_parse(data[i + 20:i + length]))
+                i += (length + 3) & ~3
+        return msgs
+
+    def interfaces(self):
+        """Every wireless interface: name, ifindex, mode, SSID, frequency."""
+        if self.family is None:
+            return []
+        try:
+            replies = self._request(self.family, self.CMD_GET_INTERFACE, dump=True)
+        except OSError:
+            return []
+        out = []
+        for a in replies:
+            try:
+                out.append({
+                    "name": a[self.ATTR_IFNAME].rstrip(b"\0").decode("ascii", "replace"),
+                    "ifindex": struct.unpack_from("=I", a[self.ATTR_IFINDEX])[0],
+                    "iftype": struct.unpack_from("=I", a[self.ATTR_IFTYPE])[0],
+                    "ssid": clean(a.get(self.ATTR_SSID, b"").decode("utf-8", "replace"), 64) or None,
+                    "freq": struct.unpack_from("=I", a[self.ATTR_WIPHY_FREQ])[0] if self.ATTR_WIPHY_FREQ in a else None,
+                })
+            except (KeyError, struct.error):
+                continue
+        return out
+
+    def stations(self, ifindex):
+        """mac → what the driver knows about that associated device."""
+        if self.family is None:
+            return {}
+        try:
+            replies = self._request(self.family, self.CMD_GET_STATION,
+                                    _nla(self.ATTR_IFINDEX, struct.pack("=I", ifindex)), dump=True)
+        except OSError:
+            return {}
+        out = {}
+        for a in replies:
+            raw = a.get(self.ATTR_MAC)
+            if not raw or len(raw) < 6 or self.ATTR_STA_INFO not in a:
+                continue
+            info = _nla_parse(a[self.ATTR_STA_INFO])
+
+            def num(kind, fmt):
+                return struct.unpack_from(fmt, info[kind])[0] if kind in info and len(info[kind]) >= struct.calcsize(fmt) else None
+
+            rate = None
+            if self.STA_TX_BITRATE in info:
+                r = _nla_parse(info[self.STA_TX_BITRATE])
+                if self.RATE_BITRATE32 in r and len(r[self.RATE_BITRATE32]) >= 4:
+                    rate = struct.unpack_from("=I", r[self.RATE_BITRATE32])[0] / 10.0
+                elif self.RATE_BITRATE in r and len(r[self.RATE_BITRATE]) >= 2:
+                    rate = struct.unpack_from("=H", r[self.RATE_BITRATE])[0] / 10.0
+            mac = ":".join("%02x" % b for b in raw[:6])
+            out[mac] = {
+                "rx": num(self.STA_RX64, "=Q") if self.STA_RX64 in info else num(self.STA_RX32, "=I"),   # from it: its upload
+                "tx": num(self.STA_TX64, "=Q") if self.STA_TX64 in info else num(self.STA_TX32, "=I"),   # to it: its download
+                "signal": num(self.STA_SIGNAL, "=b"),
+                "connected_for": num(self.STA_CONNECTED, "=I"),
+                "inactive_ms": num(self.STA_INACTIVE, "=I"),
+                "link_mbps": rate,
+            }
+        return out
+
+    def disconnect(self, ifindex, mac):
+        if self.family is None:
+            raise HotspotError("Wi-Fi control is not available")
+        try:
+            self._request(self.family, self.CMD_DEL_STATION,
+                          _nla(self.ATTR_IFINDEX, struct.pack("=I", ifindex)) +
+                          _nla(self.ATTR_MAC, bytes(int(x, 16) for x in mac.split(":"))))
+        except OSError as e:
+            raise HotspotError("could not disconnect it: %s" % (e.strerror or e))
+
+
+class Oui:
+    """MAC address → manufacturer, from the IEEE list (package ieee-data)."""
+
+    def __init__(self):
+        self.table = None
+
+    def vendor(self, mac):
+        """(vendor or None, private) — phones use a random, "locally
+        administered" address per network, which belongs to no manufacturer."""
+        if int(mac[:2], 16) & 0x02:
+            return None, True
+        if self.table is None:
+            self.table = {}
+            for path in OUI_FILES:
+                data = _read(path, 32 << 20)
+                if not data:
+                    continue
+                for line in data.splitlines():
+                    prefix, sep, name = line.partition(b"(hex)")
+                    if sep:
+                        key = prefix.strip().replace(b"-", b"").decode("ascii", "replace").lower()
+                        if len(key) == 6:
+                            self.table[key] = clean(name.strip().decode("utf-8", "replace"), 60)
+                break
+        return self.table.get(mac[:8].replace(":", "")), False
+
+
+def _ipv4(text):
+    try:
+        return str(ipaddress.IPv4Address(text))
+    except (ipaddress.AddressValueError, ValueError):
+        return None
+
+
+def read_leases(iface):
+    """dnsmasq's leases for one shared interface: mac → (ip, hostname, expiry)."""
+    out = {}
+    for line in _read(NM_LEASES % iface, 1 << 20).splitlines():
+        f = line.decode("utf-8", "replace").split()
+        if len(f) < 4:
+            continue
+        mac, ip = f[1].lower(), _ipv4(f[2])
+        if not MAC_ADDR.fullmatch(mac) or ip is None:
+            continue
+        try:
+            expires = int(f[0])
+        except ValueError:
+            expires = 0
+        out[mac] = {"ip": ip, "hostname": None if f[3] == "*" else clean(f[3], 64), "expires": expires}
+    return out
+
+
+def read_neighbours():
+    """The kernel's ARP table: iface → {mac: ip} for complete entries."""
+    out = {}
+    for line in _read("/proc/net/arp", 1 << 20).splitlines()[1:]:
+        f = line.decode("ascii", "replace").split()
+        if len(f) >= 6 and int(f[2], 16) & 0x2 and MAC_ADDR.fullmatch(f[3].lower()) and _ipv4(f[0]):
+            out.setdefault(f[5], {})[f[3].lower()] = f[0]
+    return out
+
+
+def iface_ipv4(name):
+    """The interface's primary IPv4 address (SIOCGIFADDR), or None."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            raw = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", name.encode()[:15]))
+        return socket.inet_ntoa(raw[20:24])
+    except OSError:
+        return None
+
+
+def nft_run(script=None, args=()):
+    """Run nft — fixed absolute path, no shell, a clean environment; the
+    ruleset goes in on stdin. Every value put into a ruleset is validated
+    first (MAC regex, ipaddress, int, interface-name regex)."""
+    if NFT is None:
+        raise HotspotError("nftables is not installed (sudo apt install nftables)")
+    cmd = [NFT] + list(args) + (["-f", "-"] if script is not None else [])
+    try:
+        r = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=15,
+                           env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError) as e:
+        raise HotspotError("nft did not run: %s" % e)
+    if r.returncode:
+        lines = (r.stderr or "").strip().splitlines()
+        raise HotspotError("nft: " + clean(lines[0] if lines else "failed (%d)" % r.returncode, 300))
+    return r.stdout
+
+
+def nft_counters():
+    """What the kernel has counted today, or None when the table is not loaded:
+    {"up": bytes per MAC, "down": bytes per IPv4, "used": quota bytes per MAC,
+     "packets": (up, down) totals}."""
+    try:
+        data = json.loads(nft_run(args=("-j", "list", "table", "inet", NFT_TABLE)))
+    except (HotspotError, ValueError):
+        return None
+    up, down, used, packets = {}, {}, {}, [0, 0]
+    for obj in data.get("nftables", []) if isinstance(data, dict) else []:
+        if not isinstance(obj, dict):
+            continue
+        s = obj.get("set")
+        if isinstance(s, dict) and s.get("name") in ("dev_up", "dev_down"):
+            target = up if s["name"] == "dev_up" else down
+            for e in s.get("elem", []):
+                elem = e.get("elem") if isinstance(e, dict) else None
+                if isinstance(elem, dict) and isinstance(elem.get("val"), str):
+                    counter = elem.get("counter") or {}
+                    target[elem["val"].lower()] = int(counter.get("bytes", 0))
+                    packets[s["name"] == "dev_down"] += int(counter.get("packets", 0))
+        q = obj.get("quota")
+        if isinstance(q, dict) and str(q.get("name", "")).startswith("q_"):
+            hexmac = q["name"][2:]
+            if len(hexmac) == 12:
+                used[":".join(hexmac[i:i + 2] for i in range(0, 12, 2))] = int(q.get("used", 0))
+    return {"up": up, "down": down, "used": used, "packets": tuple(packets)}
+
+
+def nft_ruleset(ifaces, devices, seed_up, seed_down, seed_used):
+    """The whole table, as one atomic transaction that replaces the old one.
+    Order in the chain: blocked → speed limits → daily quotas → counting, so a
+    dropped packet is neither counted as used nor charged to the quota."""
+    names = ", ".join('"%s"' % n for n in sorted(ifaces))
+    out = ["table inet %s {}" % NFT_TABLE, "delete table inet %s" % NFT_TABLE, "table inet %s {" % NFT_TABLE]
+
+    def declare(name, kind, elements, dynamic=False):
+        out.append("  set %s {" % name)
+        out.append("    type %s;%s" % (kind, " flags dynamic; counter; size 65535;" if dynamic else ""))
+        if elements:
+            out.append("    elements = { %s }" % ", ".join(elements))
+        out.append("  }")
+
+    declare("dev_up", "ether_addr", ["%s counter packets 0 bytes %d" % (m, b)
+                                     for m, b in sorted(seed_up.items()) if b > 0], dynamic=True)
+    declare("dev_down", "ipv4_addr", ["%s counter packets 0 bytes %d" % (ip, b)
+                                      for ip, b in sorted(seed_down.items()) if b > 0], dynamic=True)
+    declare("blocked", "ether_addr", sorted(m for m, d in devices.items() if d.get("blocked")))
+    declare("blocked4", "ipv4_addr", sorted({d["ip"] for d in devices.values() if d.get("blocked") and d.get("ip")}))
+    rules = []
+    for mac, d in sorted(devices.items()):
+        ip = d.get("ip")
+        if d.get("up"):
+            rules.append("iifname { %s } ether saddr %s limit rate over %d bytes/second drop" % (names, mac, d["up"]))
+        if d.get("down") and ip:
+            rules.append("oifname { %s } ip daddr %s limit rate over %d bytes/second drop" % (names, ip, d["down"]))
+        if d.get("quota"):
+            q = "q_" + mac.replace(":", "")
+            out.append("  quota %s { over %d bytes used %d bytes; }" % (q, d["quota"], min(seed_used.get(mac, 0), 1 << 62)))
+            rules.append('iifname { %s } ether saddr %s quota name "%s" drop' % (names, mac, q))
+            if ip:
+                rules.append('oifname { %s } ip daddr %s quota name "%s" drop' % (names, ip, q))
+    out += ["  chain forward {",
+            "    type filter hook forward priority filter - 10; policy accept;",
+            "    iifname { %s } ether saddr @blocked drop" % names,
+            "    oifname { %s } ip daddr @blocked4 drop" % names]
+    out += ["    " + r for r in rules]
+    out += ["    iifname { %s } update @dev_up { ether saddr }" % names,
+            "    oifname { %s } update @dev_down { ip daddr }" % names,
+            "  }", "}", ""]
+    return "\n".join(out)
+
+
+def today():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _valid_int(value, low, high):
+    return value is None or (isinstance(value, int) and not isinstance(value, bool) and low <= value <= high)
+
+
+class Hotspot:
+    """Everything about the shared connection: detection, the device list, the
+    nftables table, the state file, and the window's commands."""
+
+    def __init__(self, own=True, wait=0.0):
+        self.nl = Nl80211()
+        self.oui = Oui()
+        self.ifaces = {}             # name → {"name", "ifindex", "ssid", "freq", "wifi"}
+        self.prev_station = {}       # ("sta"|"nft", mac) → (up, down) counters, last tick
+        self.prev_fwd = None         # (up, down) forwarded totals from nft, last tick
+        self.counters = None         # latest nft_counters()
+        self.saved_at = 0.0
+        self.lock = None
+        self.error = None            # why the controls are unavailable, if they are
+        self.state = self._load()
+        if own:
+            self.own(wait)
+
+    # state & lock ----------------------------------------------------------
+    @staticmethod
+    def _empty():
+        return {"version": 1, "day": today(), "ifaces": [], "devices": {}, "history": {}}
+
+    def _load(self):
+        try:
+            with open(STATE_FILE, "rb") as f:
+                state = json.loads(f.read(8 << 20))
+        except (OSError, ValueError):
+            return self._empty()
+        if not isinstance(state, dict) or state.get("version") != 1:
+            return self._empty()
+        fresh = self._empty()
+        fresh["day"] = state.get("day") if isinstance(state.get("day"), str) else fresh["day"]
+        fresh["ifaces"] = [n for n in state.get("ifaces", []) if isinstance(n, str) and IFNAME.fullmatch(n)]
+        for mac, d in (state.get("devices") or {}).items():
+            if isinstance(mac, str) and MAC_ADDR.fullmatch(mac) and isinstance(d, dict):
+                fresh["devices"][mac] = self._sanitize(d)
+        if isinstance(state.get("history"), dict):
+            fresh["history"] = {k: v for k, v in state["history"].items()
+                                if isinstance(k, str) and isinstance(v, dict)}
+        return fresh
+
+    @staticmethod
+    def _sanitize(d):
+        out = {
+            "name": clean(d["name"], 64) if isinstance(d.get("name"), str) and d["name"].strip() else None,
+            "hostname": clean(d["hostname"], 64) if isinstance(d.get("hostname"), str) else None,
+            "ip": _ipv4(d.get("ip") or ""),
+            "blocked": d.get("blocked") is True,
+            "up": d.get("up") if _valid_int(d.get("up"), *LIMIT_RANGE) else None,
+            "down": d.get("down") if _valid_int(d.get("down"), *LIMIT_RANGE) else None,
+            "quota": d.get("quota") if _valid_int(d.get("quota"), *QUOTA_RANGE) else None,
+            "used_up": d.get("used_up") if _valid_int(d.get("used_up"), 0, 1 << 62) else 0,
+            "used_down": d.get("used_down") if _valid_int(d.get("used_down"), 0, 1 << 62) else 0,
+            "quota_used": d.get("quota_used") if _valid_int(d.get("quota_used"), 0, 1 << 62) else 0,
+            "last_seen": d.get("last_seen") if isinstance(d.get("last_seen"), (int, float)) else 0,
+        }
+        return out
+
+    def save(self):
+        try:
+            os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+            tmp = STATE_FILE + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.state, f, indent=1, sort_keys=True)
+            os.replace(tmp, STATE_FILE)
+            self.saved_at = time.monotonic()
+        except OSError as e:
+            self.error = "cannot save %s: %s" % (STATE_FILE, e.strerror or e)
+
+    def own(self, wait=0.0):
+        """Take the lock that says "this helper manages the table". Held until
+        exit. `wait`: how long to keep trying — the systemd jobs hold it for a
+        moment, a window's helper for as long as the window is open."""
+        try:
+            os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+            fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        os.close(fd)
+                        self.error = "another Netwatch is managing the hotspot right now"
+                        return False
+                    time.sleep(0.2)
+            self.lock = fd
+            self.state = self._load()    # what the previous owner left, not what was read before the wait
+            if self.state["ifaces"] and NFT and nft_counters() is None:
+                # the table is not in the kernel (a reboot the boot job has not
+                # caught up with, or someone flushed the ruleset): put it back
+                try:
+                    self.apply()
+                except HotspotError as e:
+                    self.error = str(e)
+            return True
+        except OSError as e:
+            self.error = "cannot use %s: %s" % (STATE_DIR, e.strerror or e)
+            return False
+
+    # detection -------------------------------------------------------------
+    def detect(self, kinds):
+        """Which interfaces share this computer's connection right now."""
+        found = {}
+        for w in self.nl.interfaces():
+            if w["iftype"] == Nl80211.IFTYPE_AP and IFNAME.fullmatch(w["name"]):
+                found[w["name"]] = dict(w, wifi=True)
+        for name in kinds:           # sharing over a cable / USB (NetworkManager "shared")
+            if name in found or kinds[name] in ("loopback", "bridge", "bridge-port") or not IFNAME.fullmatch(name):
+                continue
+            ip = iface_ipv4(name)
+            if ip and ip.startswith("10.42.") and os.path.exists(NM_LEASES % name):
+                found[name] = {"name": name, "ifindex": None, "ssid": None, "freq": None, "wifi": False}
+        self.ifaces = found
+        return set(found)
+
+    # one tick ----------------------------------------------------------------
+    def poll(self, now):
+        """The device list for this interval, plus the bytes forwarded for them
+        (the uplink capture sees those NAT-rewritten, as nobody's)."""
+        st = self.state
+        if st["day"] != today() and self.lock is not None:
+            self.new_day()
+        if self.ifaces and self.lock is not None:
+            known = set(st["ifaces"])
+            if not set(self.ifaces) <= known:
+                st["ifaces"] = sorted(known | set(self.ifaces))
+                self._apply_safely()
+        self.counters = nft_counters() if (st["ifaces"] and NFT) else None
+        c = self.counters or {"up": {}, "down": {}, "used": {}, "packets": (0, 0)}
+        up_c, down_c, used_c = c["up"], c["down"], c["used"]
+
+        neigh = read_neighbours()
+        seen = {}
+        for name, iface in self.ifaces.items():
+            leases = read_leases(name)
+            stations = self.nl.stations(iface["ifindex"]) if iface["wifi"] else {}
+            arp = neigh.get(name, {})
+            wall_now = time.time()
+            macs = set(stations) | set(arp) | {m for m, l in leases.items()
+                                               if l["expires"] == 0 or l["expires"] > wall_now}
+            for mac in macs:
+                lease = leases.get(mac, {})
+                seen[mac] = {"iface": name, "station": stations.get(mac),
+                             "ip": lease.get("ip") or arp.get(mac), "hostname": lease.get("hostname"),
+                             "connected": mac in stations if iface["wifi"] else mac in arp}
+
+        changed_ip = False
+        devices = []
+        wall = time.time()
+        for mac in sorted(set(seen) | set(st["devices"])):
+            d = st["devices"].get(mac)
+            live = seen.get(mac)
+            if d is None:
+                d = st["devices"][mac] = self._sanitize({})
+            if live:
+                if live["ip"] and live["ip"] != d["ip"]:
+                    changed_ip = changed_ip or bool(d["blocked"] or d["down"] or d["quota"])
+                    d["ip"] = live["ip"]
+                if live["hostname"]:
+                    d["hostname"] = live["hostname"]
+                if live["connected"]:
+                    d["last_seen"] = wall
+            elif wall - d["last_seen"] > FORGET_DEVICE_DAYS * 86400 and not (
+                    d["blocked"] or d["up"] or d["down"] or d["quota"]):
+                del st["devices"][mac]
+                continue
+            if self.counters is not None:
+                d["used_up"] = up_c.get(mac, 0)
+                d["used_down"] = down_c.get(d["ip"], 0) if d["ip"] else 0
+                d["quota_used"] = used_c.get(mac, 0)
+            station = live["station"] if live else None
+            if station and station["rx"] is not None and station["tx"] is not None:
+                # The driver's own counters, exact, and they include traffic to
+                # this computer itself. The access point *receives* the
+                # device's upload and *transmits* its download.
+                now_up, now_down = self._delta(("sta", mac), station["rx"], station["tx"])
+            elif self.counters is not None:
+                now_up, now_down = self._delta(("nft", mac), d["used_up"], d["used_down"])
+            else:
+                now_up = now_down = 0
+            vendor, private = self.oui.vendor(mac)
+            iface = self.ifaces.get(live["iface"]) if live else None
+            devices.append({
+                "mac": mac, "ip": d["ip"], "hostname": d["hostname"], "name": d["name"],
+                "vendor": vendor, "private_mac": private,
+                "iface": live["iface"] if live else None, "ssid": iface["ssid"] if iface else None,
+                "connected": bool(live and live["connected"]), "last_seen": d["last_seen"] or None,
+                "signal": station["signal"] if station else None,
+                "connected_for": station["connected_for"] if station else None,
+                "inactive_ms": station["inactive_ms"] if station else None,
+                "link_mbps": station["link_mbps"] if station else None,
+                "now_up": now_up, "now_down": now_down,     # bytes this interval
+                "today_up": d["used_up"], "today_down": d["used_down"],
+                "quota_used": d["quota_used"] if d["quota"] else None,
+                "rules": {"blocked": d["blocked"], "up": d["up"], "down": d["down"], "quota": d["quota"]},
+            })
+        if changed_ip and self.lock is not None:
+            self._apply_safely()
+
+        fwd = None
+        if self.counters is not None:
+            # nft counts IP packets; the uplink capture counts Ethernet frames, 14 bytes more each
+            total = (sum(up_c.values()) + 14 * c["packets"][0], sum(down_c.values()) + 14 * c["packets"][1])
+            if self.prev_fwd is not None:
+                fwd = tuple(max(0, a - b) for a, b in zip(total, self.prev_fwd))
+            self.prev_fwd = total
+        if self.lock is not None and now - self.saved_at >= SAVE_EVERY:
+            self.save()
+        return {
+            "active": bool(self.ifaces),
+            "ifaces": [{"name": i["name"], "ssid": i["ssid"], "freq": i["freq"], "wifi": i["wifi"]}
+                       for i in self.ifaces.values()],
+            "controls": self.lock is not None and NFT is not None,
+            "error": self.error if self.lock is None or NFT is None else None,
+            "devices": devices,
+            "forwarded": fwd,    # (device upload, device download) bytes this interval, or None
+        }
+
+    def _delta(self, key, up, down):
+        prev = self.prev_station.get(key)
+        self.prev_station[key] = (up, down)
+        if prev is None:
+            return 0, 0
+        # a counter that went down means the device reconnected (or a new day): count from zero
+        return (up - prev[0] if up >= prev[0] else up), (down - prev[1] if down >= prev[1] else down)
+
+    def _apply_safely(self):
+        try:
+            self.apply()
+        except HotspotError as e:
+            self.error = str(e)
+
+    # the table ------------------------------------------------------------------
+    def apply(self, zero=()):
+        """Rebuild the nftables table from the state, carrying over what the
+        kernel has counted so far today (except for the MACs in `zero`)."""
+        st = self.state
+        if not st["ifaces"]:
+            return
+        current = nft_counters()
+        seed_up, seed_down, seed_used = {}, {}, {}
+        if current is not None:
+            seed_up, seed_down, seed_used = current["up"], current["down"], current["used"]
+        else:                        # after a reboot: what was saved
+            for mac, d in st["devices"].items():
+                seed_up[mac] = d["used_up"]
+                if d["ip"]:
+                    seed_down[d["ip"]] = d["used_down"]
+                seed_used[mac] = d["quota_used"]
+        for mac in zero:
+            seed_up.pop(mac, None)
+            seed_used.pop(mac, None)
+            ip = st["devices"].get(mac, {}).get("ip")
+            if ip:
+                seed_down.pop(ip, None)
+        nft_run(nft_ruleset(st["ifaces"], st["devices"], seed_up, seed_down, seed_used))
+        self.prev_fwd = None
+
+    def new_day(self):
+        """Midnight: file yesterday's usage under its date, start from zero."""
+        st = self.state
+        counters = nft_counters()
+        if counters is not None:
+            up_c, down_c = counters["up"], counters["down"]
+            for mac, d in st["devices"].items():
+                d["used_up"] = up_c.get(mac, 0)
+                d["used_down"] = down_c.get(d["ip"], 0) if d["ip"] else 0
+        day = {mac: [d["used_up"], d["used_down"]] for mac, d in st["devices"].items()
+               if d["used_up"] or d["used_down"]}
+        if day:
+            st["history"][st["day"]] = day
+        for old in sorted(st["history"])[:-HISTORY_DAYS]:
+            del st["history"][old]
+        for d in st["devices"].values():
+            d["used_up"] = d["used_down"] = d["quota_used"] = 0
+        st["day"] = today()
+        try:
+            if st["ifaces"]:
+                nft_run(nft_ruleset(st["ifaces"], st["devices"], {}, {}, {}))
+        except HotspotError as e:
+            self.error = str(e)
+        self.prev_fwd = None
+        self.save()
+
+    def save_usage(self):
+        counters = nft_counters()
+        if counters is not None:
+            up_c, down_c, used_c = counters["up"], counters["down"], counters["used"]
+            for mac, d in self.state["devices"].items():
+                d["used_up"] = up_c.get(mac, 0)
+                d["used_down"] = down_c.get(d["ip"], 0) if d["ip"] else 0
+                d["quota_used"] = used_c.get(mac, 0)
+        self.save()
+
+    # the window's commands ------------------------------------------------------
+    def command(self, msg):
+        """One command from the window. Returns the ack to send back."""
+        ack = {"type": "ack", "id": msg.get("id") if isinstance(msg.get("id"), int) else None, "ok": False}
+        try:
+            if self.lock is None:
+                raise HotspotError(self.error or "the hotspot controls are not available")
+            mac = msg.get("mac")
+            if not isinstance(mac, str) or not MAC_ADDR.fullmatch(mac):
+                raise HotspotError("not a MAC address")
+            cmd = msg.get("cmd")
+            if cmd == "set_device":
+                for key, rng in (("up", LIMIT_RANGE), ("down", LIMIT_RANGE), ("quota", QUOTA_RANGE)):
+                    if not _valid_int(msg.get(key), *rng):
+                        raise HotspotError("%s must be between %d and %d" % (key, rng[0], rng[1]))
+                if not isinstance(msg.get("blocked"), bool):
+                    raise HotspotError("blocked must be true or false")
+                name = msg.get("name")
+                if name is not None and (not isinstance(name, str) or len(name) > 64):
+                    raise HotspotError("the name is too long")
+                devices = self.state["devices"]
+                before = dict(devices[mac]) if mac in devices else None
+                d = devices.setdefault(mac, self._sanitize({}))
+                d.update(blocked=msg["blocked"], up=msg.get("up"), down=msg.get("down"), quota=msg.get("quota"),
+                         name=clean(name.strip(), 64) if name and name.strip() else None)
+                try:
+                    self.apply()
+                except HotspotError:
+                    if before is None:
+                        del devices[mac]
+                    else:
+                        devices[mac] = before
+                    raise
+            elif cmd == "reset_today":
+                d = self.state["devices"].get(mac)
+                if d is None:
+                    raise HotspotError("unknown device")
+                saved = (d["used_up"], d["used_down"], d["quota_used"])
+                d["used_up"] = d["used_down"] = d["quota_used"] = 0
+                try:
+                    self.apply(zero=(mac,))
+                except HotspotError:
+                    d["used_up"], d["used_down"], d["quota_used"] = saved
+                    raise
+            elif cmd == "disconnect":
+                where = [i for i in self.ifaces.values()
+                         if i["wifi"] and mac in self.nl.stations(i["ifindex"])]
+                if not where:
+                    raise HotspotError("that device is not connected over Wi-Fi")
+                self.nl.disconnect(where[0]["ifindex"], mac)
+            else:
+                raise HotspotError("unknown command")
+            self.save()
+            ack["ok"] = True
+        except HotspotError as e:
+            ack["error"] = str(e)
+        return ack
+
+
+def run_service(action):
+    """The systemd side: --restore at boot, --save-usage at shutdown, --new-day
+    at midnight. Steps aside if a window's helper owns the table right now."""
+    if not os.path.exists(STATE_FILE):
+        return 0
+    # another job (boot restore and a missed midnight run together) holds the
+    # lock for a second or two; a window's helper holds it for good, and then
+    # does all of this itself
+    hs = Hotspot(own=True, wait=20.0)
+    if hs.lock is None:
+        return 0
+    try:
+        if action == "restore":
+            if hs.state["day"] != today():
+                hs.new_day()
+            elif hs.state["ifaces"]:
+                hs.apply()
+            hs.save()
+        elif action == "save-usage":
+            hs.save_usage()
+        elif action == "new-day":
+            if hs.state["day"] != today():
+                hs.new_day()
+    except HotspotError as e:
+        sys.stderr.write("netwatch-helper: %s\n" % e)
+        return 1
+    return 0
+
+
+# ── the monitor ─────────────────────────────────────────────────────────────
+class Monitor:
+    def __init__(self, interval, forced_ifaces, emit, hotspot=True):
+        self.interval = interval
+        self.forced = forced_ifaces
+        self.emit = emit
+        self.hotspot = Hotspot(own=True) if hotspot else None
+        self.hotspot_ifaces = set()
+        self.stdin_buf = b""
+        self.rings = {}              # ifname → Ring
+        self.by_fd = {}
+        self.kinds = {}              # ifname → kind, for every interface present
+        self.counted = set()
+        self.uplinks = set()
+        self.dev_prev = {}
+        self.poller = select.poll()
+        self.sockets = SocketTable()
+        self.owners = {}
+        self.owners_full_at = -1e9
+        self.hot = {}                # pid → last time it moved data (insertion order = recency)
+        self.procs = ProcCache()
+        self.flow_pid = {}           # flow → pid, valid for one interval
+        self.retry_at = {}           # flow → when a failed lookup may be retried
+        self.unresolved = set()      # flows to look up at the end of this batch of packets
+        self.fallback = {}           # flow → owner of its listener, if the exact owner never shows
+        self.pending = {}            # flow → [rx, tx] whose owner is not known yet
+        self.tokens = RESOLVE_BURST
+        self.tokens_at = time.monotonic()
+        self.pid_bytes = {}          # pid → [rx, tx] this interval
+        self.seq = 0
+        self.open_errors = {}
+
+    # interfaces ----------------------------------------------------------
+    def refresh_ifaces(self):
+        try:
+            present = sorted(os.listdir("/sys/class/net"))
+        except OSError:
+            present = []
+        self.kinds = {n: iface_kind(n) for n in present}
+        # A shared interface (the hotspot) carries the devices' traffic, which
+        # also crosses the uplink after NAT: capturing both would count it twice.
+        # Its devices are measured by Hotspot instead.
+        self.hotspot_ifaces = self.hotspot.detect(self.kinds) if self.hotspot else set()
+        for name in self.hotspot_ifaces:
+            self.kinds[name] = "hotspot"
+        if self.forced:
+            counted = {n for n in self.forced if n in self.kinds}
+            uplinks = set(counted)
+        else:
+            counted = {n for n, k in self.kinds.items() if k in ("physical", "vpn")}
+            if not counted:   # no NIC at all (a container, a test namespace): take what there is
+                counted = {n for n, k in self.kinds.items() if k == "virtual"}
+            # the totals: the physical way out — the one with the default route
+            # (not a VPN's tun, whose bytes the physical card carries again, encrypted)
+            physical = {n for n in counted if self.kinds[n] == "physical"}
+            uplinks = (physical & default_route_ifaces()) or physical or set(counted)
+        for name in list(self.rings):
+            if name not in counted:
+                self._close(self.rings[name])
+        for name in sorted(counted - set(self.rings)):
+            try:
+                ring = Ring(name)
+            except OSError as e:
+                self.open_errors[name] = e.strerror or str(e)
+                continue
+            self.open_errors.pop(name, None)
+            self.rings[name] = ring
+            self.by_fd[ring.fileno()] = ring
+            self.poller.register(ring.fileno(), select.POLLIN)
+        self.counted = set(self.rings)
+        self.uplinks = uplinks & self.counted
+
+    def _close(self, ring):
+        self.rings.pop(ring.ifname, None)
+        self.by_fd.pop(ring.fileno(), None)
+        try:
+            self.poller.unregister(ring.fileno())
+        except (KeyError, ValueError):
+            pass
+        ring.close()
+
+    def iface_list(self):
+        return [{"name": n, "kind": self.kinds.get(n, "?"), "uplink": n in self.uplinks}
+                for n in sorted(self.counted)]
+
+    # packets -------------------------------------------------------------
+    def drain(self, ring, now, budget=20_000):
+        mm = ring.mm
+        unpack = FRAME_HDR.unpack_from
+        i = ring.head
+        done = 0
+        while done < budget:
+            off = i * FRAME_SIZE
+            status, plen, snap, mac, net = unpack(mm, off)
+            if not status & TP_STATUS_USER:
+                break
+            pkttype = mm[off + SLL_PKTTYPE]
+            if pkttype != PACKET_OTHERHOST:
+                self.packet(mm, off + net, off + mac + snap, plen, pkttype == PACKET_OUTGOING, now)
+            mm[off:off + 4] = RELEASE
+            i = i + 1 if i + 1 < FRAMES else 0
+            done += 1
+        ring.head = i
+        return done
+
+    def packet(self, mm, p, end, plen, outgoing, now):
+        proto = -1
+        if end - p >= 20:
+            version = mm[p] >> 4
+            if version == 4:
+                proto = mm[p + 9]
+                src, dst = mm[p + 12:p + 16], mm[p + 16:p + 20]
+                l4 = p + (mm[p] & 15) * 4
+                if (mm[p + 6] & 0x1F) or mm[p + 7]:
+                    proto = -1           # a non-first fragment carries no ports
+            elif version == 6 and end - p >= 40:
+                proto = mm[p + 6]
+                src, dst = mm[p + 8:p + 24], mm[p + 24:p + 40]
+                l4 = p + 40
+                for _ in range(8):       # walk the extension headers to TCP/UDP
+                    if l4 + 8 > end:
+                        break
+                    if proto in (0, 43, 60):            # hop-by-hop, routing, destination
+                        proto, l4 = mm[l4], l4 + (mm[l4 + 1] + 1) * 8
+                    elif proto == 44:                   # fragment
+                        first = not (((mm[l4 + 2] << 8) | mm[l4 + 3]) >> 3)
+                        proto, l4 = (mm[l4] if first else -1), l4 + 8
+                    elif proto == 51:                   # authentication header
+                        proto, l4 = mm[l4], l4 + (mm[l4 + 1] + 2) * 4
+                    else:
+                        break
+        if (proto == 6 or proto == 17) and l4 + 4 <= end:
+            sport = (mm[l4] << 8) | mm[l4 + 1]
+            dport = (mm[l4 + 2] << 8) | mm[l4 + 3]
+            flow = (proto, src, sport, dst, dport) if outgoing else (proto, dst, dport, src, sport)
+            pid = self.flow_pid.get(flow)
+            if pid:
+                b = self.pid_bytes.get(pid)
+                if b is None:
+                    b = self.pid_bytes[pid] = [0, 0]
+            else:
+                b = self.pending.get(flow)
+                if b is None and len(self.pending) >= MAX_PENDING:
+                    # a flood of new flows (a port scan): stop tracking new ones this interval
+                    b = self.pid_bytes.setdefault(UNATTRIBUTED, [0, 0])
+                else:
+                    if b is None and now >= self.retry_at.get(flow, 0.0):
+                        # First packet of a flow nobody has placed yet: look its owner up
+                        # now, not at the end of the batch — on a fast link a short-lived
+                        # program can connect, download and exit within a few milliseconds.
+                        self.resolve((flow,), now)
+                        pid = self.flow_pid.get(flow)
+                    if pid:
+                        b = self.pid_bytes.setdefault(pid, [0, 0])
+                    else:
+                        # Held back under the flow, not dropped: once the owner is found
+                        # these bytes move to it, so a download is counted from its first packet.
+                        if b is None:
+                            b = self.pending[flow] = [0, 0]
+                        if now >= self.retry_at.get(flow, 0.0):
+                            self.unresolved.add(flow)
+        else:
+            b = self.pid_bytes.get(OTHER_PROTOCOLS)
+            if b is None:
+                b = self.pid_bytes[OTHER_PROTOCOLS] = [0, 0]
+        b[outgoing] += plen
+
+    def resolve_batch(self, now):
+        """Retry the flows of the batch just drained that are still unplaced."""
+        flows, self.unresolved = self.unresolved, set()
+        flows = [f for f in flows if f not in self.flow_pid]
+        if flows:
+            self.resolve(flows, now)
+
+    def resolve(self, flows, now):
+        """Find the owners of `flows`, within the CPU budget."""
+        self.tokens = min(RESOLVE_BURST, self.tokens + (now - self.tokens_at) * RESOLVE_SHARE)
+        self.tokens_at = now
+        if self.tokens <= 0:
+            for flow in flows:
+                self.retry_at[flow] = now + RETRY
+            return
+        started = time.monotonic()
+        self.sockets.refresh({path for flow in flows for path in SocketTable.files(flow)})
+        inodes = {flow: self.sockets.lookup(flow) for flow in flows}
+        wanted = {i for i in inodes.values() if i and i not in self.owners}
+        if wanted:
+            self.rescan(now, wanted)
+        for flow, inode in inodes.items():
+            pid = self.owners.get(inode) if inode else None
+            if pid and self.procs.get(pid) is not None:
+                self.assign(flow, pid, now)
+            elif inode:
+                self.retry_at[flow] = now + RETRY_SOON
+                if flow[0] == 6 and flow not in self.fallback:
+                    owner = self.owners.get(self.sockets.listener(flow))
+                    if owner and self.procs.get(owner) is not None:
+                        self.fallback[flow] = owner
+            else:
+                self.retry_at[flow] = now + RETRY
+        self.tokens -= time.monotonic() - started
+
+    def assign(self, flow, pid, now):
+        self.flow_pid[flow] = pid
+        held = self.pending.pop(flow, None)
+        if held:
+            b = self.pid_bytes.setdefault(pid, [0, 0])
+            b[0] += held[0]
+            b[1] += held[1]
+        self.hot.pop(pid, None)
+        self.hot[pid] = now
+        if len(self.hot) > HOT_PIDS:
+            del self.hot[next(iter(self.hot))]
+
+    def rescan(self, now, wanted=None):
+        if wanted is None or now - self.owners_full_at >= OWNERS_FULL_EVERY:
+            self.owners = {}
+            scan_owners(self.owners)
+            self.owners_full_at = now
+        else:
+            scan_owners(self.owners, wanted, reversed(self.hot))
+
+    # one report ----------------------------------------------------------
+    def tick(self, now, dt):
+        self.unresolved = set()
+        if self.pending:     # last chance, with fresh tables, for flows not yet placed
+            self.sockets.refresh()
+            inodes = {flow: self.sockets.lookup(flow) for flow in self.pending}
+            wanted = {i for i in inodes.values() if i and i not in self.owners}
+            if wanted:
+                self.rescan(now, wanted)
+            for flow, (rx, tx) in self.pending.items():
+                pid = self.owners.get(inodes[flow], 0) if inodes[flow] else 0
+                if pid and self.procs.get(pid) is None:
+                    pid = 0
+                if not pid:
+                    pid = self.fallback.get(flow, 0)
+                b = self.pid_bytes.setdefault(pid, [0, 0])
+                b[0] += rx
+                b[1] += tx
+            self.pending = {}
+        self.flow_pid = {}
+        self.retry_at = {}
+        self.fallback = {}
+
+        hotspot = self.hotspot.poll(now) if self.hotspot else None
+        if hotspot and hotspot["forwarded"]:
+            # The devices' traffic crosses the uplink NAT-rewritten, owned by no
+            # local socket, so the capture filed it as unattributed. The kernel's
+            # forward counters know exactly how much it was: move it.
+            dev_up, dev_down = hotspot["forwarded"]
+            u = self.pid_bytes.get(UNATTRIBUTED)
+            if u is not None:
+                u[0] -= min(u[0], dev_down)
+                u[1] -= min(u[1], dev_up)
+            if dev_up or dev_down:
+                self.pid_bytes[HOTSPOT_DEVICES] = [dev_down, dev_up]
+
+        dev = read_dev_counters()
+        rx_total = tx_total = 0
+        ifaces = self.iface_list()
+        for entry in ifaces:
+            rx, tx = dev.get(entry["name"], (0, 0))
+            prx, ptx = self.dev_prev.get(entry["name"], (rx, tx))
+            entry["rx"] = rx - prx if rx >= prx else 0
+            entry["tx"] = tx - ptx if tx >= ptx else 0
+            if entry["uplink"]:
+                rx_total += entry["rx"]
+                tx_total += entry["tx"]
+        self.dev_prev = dev
+
+        procs, apps = [], {}
+        for pid, (rx, tx) in sorted(self.pid_bytes.items(), key=lambda kv: -(kv[1][0] + kv[1][1])):
+            if not rx and not tx:
+                continue
+            if pid > 0:
+                p = self.procs.get(pid)
+                if p is None:
+                    pid, entry = UNATTRIBUTED, None
+                else:
+                    entry = {"pid": pid, "start": p.start, "comm": p.comm, "cmd": p.cmd, "user": p.user,
+                             "app": p.app, "via": p.via}
+            else:
+                entry = None
+            if entry is None:
+                key = {OTHER_PROTOCOLS: "other:protocols", HOTSPOT_DEVICES: "other:hotspot"}.get(
+                    pid, "other:unattributed")
+                entry = {"pid": 0, "start": 0, "comm": "", "cmd": "", "user": "", "app": key, "via": None}
+            entry["rx"], entry["tx"] = rx, tx
+            procs.append(entry)
+            apps[entry["app"]] = self.procs.apps.get(entry["app"]) or OTHER_APPS[entry["app"]]
+        self.pid_bytes = {}
+        self.procs.prune()
+
+        drops = sum(r.drops() for r in self.rings.values())
+        self.seq += 1
+        report = {"type": "tick", "seq": self.seq, "dt": round(dt, 4), "rx": rx_total, "tx": tx_total,
+                  "drops": drops, "ifaces": ifaces, "procs": procs, "apps": apps}
+        if hotspot is not None:
+            report["hotspot"] = {k: v for k, v in hotspot.items() if k != "forwarded"}
+        return report
+
+    def on_command(self, line):
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            msg = None
+        if not isinstance(msg, dict):
+            self.emit({"type": "ack", "id": None, "ok": False, "error": "not a JSON object"})
+        elif self.hotspot is None:
+            self.emit({"type": "ack", "id": msg.get("id") if isinstance(msg.get("id"), int) else None,
+                       "ok": False, "error": "hotspot support is off"})
+        else:
+            self.emit(self.hotspot.command(msg))
+
+    # main loop -----------------------------------------------------------
+    def run(self):
+        try:
+            self._run()
+        finally:
+            if self.hotspot is not None and self.hotspot.lock is not None:
+                self.hotspot.save_usage()
+
+    def _run(self):
+        self.refresh_ifaces()
+        if not self.rings:
+            reason = "; ".join("%s: %s" % kv for kv in self.open_errors.items()) or "no network interface found"
+            raise SystemExit(fail("cannot capture on any interface (%s)" % reason))
+        self.dev_prev = read_dev_counters()
+        self.sockets.refresh()
+        self.rescan(time.monotonic())
+        self.emit({"type": "hello", "protocol": PROTOCOL, "version": VERSION,
+                   "interval": self.interval, "ifaces": self.iface_list()})
+
+        watch_stdin = stat.S_ISFIFO(os.fstat(0).st_mode)   # the window's pipe: EOF means it closed
+        if watch_stdin:
+            self.poller.register(0, select.POLLIN)
+        last = time.monotonic()
+        next_tick = last + self.interval
+        next_ifaces = last + 2.0
+        while True:
+            now = time.monotonic()
+            timeout = max(0.0, min(next_tick, next_ifaces) - now)
+            for fd, ev in self.poller.poll(int(timeout * 1000) + 1):
+                if fd == 0:
+                    data = os.read(0, 65536)
+                    if not data:
+                        return
+                    self.stdin_buf += data
+                    while b"\n" in self.stdin_buf:
+                        line, self.stdin_buf = self.stdin_buf.split(b"\n", 1)
+                        if line.strip():
+                            self.on_command(line)
+                    if len(self.stdin_buf) > 1 << 16:     # a "line" this long is not a command
+                        self.stdin_buf = b""
+                    continue
+                ring = self.by_fd.get(fd)
+                if ring is None:
+                    continue
+                if ev & (select.POLLERR | select.POLLNVAL):
+                    self._close(ring)   # interface went away; refresh_ifaces reopens it if it returns
+                    continue
+                self.drain(ring, time.monotonic())
+            now = time.monotonic()
+            self.resolve_batch(now)
+            if now >= next_ifaces:
+                self.refresh_ifaces()
+                next_ifaces = now + 2.0
+            if now >= next_tick:
+                for ring in list(self.rings.values()):
+                    while self.drain(ring, now):
+                        pass
+                self.resolve_batch(now)
+                self.emit(self.tick(now, now - last))
+                last = now
+                next_tick += self.interval
+                if next_tick <= now:
+                    next_tick = now + self.interval
+
+
+OTHER_APPS = {
+    "other:hotspot": {
+        "kind": "other", "label": "Hotspot devices", "app_id": None,
+        "desc": "Phones and computers on this computer's hotspot — each one is in the Hotspot tab"},
+    "other:unattributed": {
+        "kind": "other", "label": "Unattributed", "app_id": None,
+        "desc": "Traffic no running program owns: connections that already closed, "
+                "Docker containers (NAT hides which one) and the kernel itself"},
+    "other:protocols": {
+        "kind": "other", "label": "Other protocols", "app_id": None,
+        "desc": "ARP, ICMP (ping), IGMP and anything that is not TCP or UDP"},
+}
+
+
+# ── output ──────────────────────────────────────────────────────────────────
+def human(n, per_second=False):
+    unit = "B/s" if per_second else "B"
+    for prefix in ("", "k", "M", "G", "T"):
+        if abs(n) < 1000 or prefix == "T":
+            return ("%d %s%s" if prefix == "" else "%.1f %s%s") % (n, prefix, unit)
+        n /= 1000.0
+
+
+class TextView:
+    """`sudo netwatch-top`: a table redrawn every interval, grouped by application."""
+
+    def __init__(self):
+        self.totals = {}
+        self.meta = {}
+        self.names = {}
+        self.ifaces = ""
+
+    def __call__(self, msg):
+        if msg["type"] == "hello":
+            self.ifaces = ", ".join(i["name"] for i in msg["ifaces"])
+            return
+        dt = msg["dt"] or 1.0
+        self.meta.update(msg["apps"])
+        now = {}
+        for p in msg["procs"]:
+            key = p["app"]
+            n = now.setdefault(key, [0, 0])
+            n[0] += p["rx"]
+            n[1] += p["tx"]
+            t = self.totals.setdefault(key, [0, 0])
+            t[0] += p["rx"]
+            t[1] += p["tx"]
+            if p["pid"]:
+                self.names.setdefault(key, set()).add(p["comm"])
+        try:
+            cols, rows = os.get_terminal_size()
+        except OSError:
+            cols, rows = 100, 30
+        out = ["\x1b[H\x1b[2J",
+               "netwatch  %s   ↓ %s   ↑ %s   (Ctrl-C to quit)" % (
+                   self.ifaces, human(msg["rx"] / dt, True), human(msg["tx"] / dt, True)),
+               ""]
+        if msg["drops"]:
+            out.append("  ! %d packets dropped by the capture — the per-app numbers are a little low" % msg["drops"])
+        out.append("  %-34s %11s %11s %11s %11s" % ("APPLICATION", "↓ NOW", "↑ NOW", "↓ TOTAL", "↑ TOTAL"))
+        order = sorted(self.totals, key=lambda k: (-sum(now.get(k, (0, 0))), -sum(self.totals[k])))
+        for key in order[:max(5, rows - 6)]:
+            m = self.meta.get(key, {})
+            label = m.get("label", key)
+            if m.get("kind") == "service":
+                label += " (service)"
+            n = now.get(key, (0, 0))
+            t = self.totals[key]
+            out.append("  %-34s %11s %11s %11s %11s" % (
+                label[:34], human(n[0] / dt, True), human(n[1] / dt, True), human(t[0]), human(t[1])))
+        hs = msg.get("hotspot")
+        if hs and (hs["active"] or hs["devices"]):
+            ssids = ", ".join("%s (%s)" % (i["ssid"] or "shared", i["name"]) for i in hs["ifaces"]) or "off"
+            on = [d for d in hs["devices"] if d["connected"]]
+            out += ["", "  HOTSPOT  %s   %d device%s connected" % (ssids, len(on), "" if len(on) == 1 else "s"),
+                    "  %-24s %-15s %7s %11s %11s %10s  %s" % ("DEVICE", "IP", "SIGNAL", "↓ NOW", "↑ NOW", "TODAY", "LIMITS")]
+            for d in sorted(hs["devices"], key=lambda d: (not d["connected"], -(d["today_up"] + d["today_down"]))):
+                name = d["name"] or d["hostname"] or d["vendor"] or d["mac"]
+                r = d["rules"]
+                limits = ["BLOCKED"] if r["blocked"] else []
+                if r["down"]:
+                    limits.append("↓" + human(r["down"], True))
+                if r["up"]:
+                    limits.append("↑" + human(r["up"], True))
+                if r["quota"]:
+                    limits.append("day %s/%s" % (human(d["quota_used"] or 0), human(r["quota"])))
+                out.append("  %-24s %-15s %7s %11s %11s %10s  %s" % (
+                    (name if d["connected"] else name + " (away)")[:24], d["ip"] or "—",
+                    "%d dBm" % d["signal"] if d["signal"] is not None else "—",
+                    human(d["now_down"] / dt, True), human(d["now_up"] / dt, True),
+                    human(d["today_up"] + d["today_down"]), " ".join(limits)))
+        sys.stdout.write("\n".join(line[:cols] for line in out) + "\n")
+        sys.stdout.flush()
+
+
+def json_out(msg):
+    sys.stdout.write(json.dumps(msg, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def fail(message):
+    """Report a fatal error the way the caller can read it, then exit 1."""
+    if not sys.stdout.isatty():
+        try:
+            json_out({"type": "error", "message": message})
+        except OSError:
+            pass
+    sys.stderr.write("netwatch-helper: %s\n" % message)
+    return 1
+
+
+IFNAME = re.compile(r"[A-Za-z0-9_.:@-]{1,15}")
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="netwatch-helper",
+        description="Live network usage per application (needs root).")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--json", action="store_true", help="one JSON report per line (for the window)")
+    mode.add_argument("--text", action="store_true", help="a table redrawn in the terminal")
+    ap.add_argument("--interval", type=float, default=1.0, help="seconds between reports (0.25–10)")
+    ap.add_argument("--interfaces", help="comma-separated interfaces to capture instead of the uplinks")
+    ap.add_argument("--no-hotspot", action="store_true", help="leave the hotspot (devices, limits) alone")
+    service = ap.add_mutually_exclusive_group()
+    service.add_argument("--restore", action="store_true", help=argparse.SUPPRESS)      # systemd, at boot
+    service.add_argument("--save-usage", action="store_true", help=argparse.SUPPRESS)   # systemd, at shutdown
+    service.add_argument("--new-day", action="store_true", help=argparse.SUPPRESS)      # systemd timer, midnight
+    ap.add_argument("--version", action="version", version="netwatch-helper " + VERSION)
+    args = ap.parse_args(argv)
+    action = "restore" if args.restore else "save-usage" if args.save_usage else "new-day" if args.new_day else None
+    if action:
+        if os.geteuid() != 0:
+            return fail("needs root")
+        return run_service(action)
+
+    if not 0.25 <= args.interval <= 10:
+        ap.error("--interval must be between 0.25 and 10")
+    forced = None
+    if args.interfaces:
+        forced = [n for n in args.interfaces.split(",") if n]
+        if not forced or not all(IFNAME.fullmatch(n) for n in forced):
+            ap.error("--interfaces takes interface names like enp3s0,wlan0")
+    if os.geteuid() != 0:
+        return fail("needs root — run it with sudo (the Netwatch window asks through pkexec)")
+
+    text = args.text or (not args.json and sys.stdout.isatty())
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        Monitor(args.interval, forced, TextView() if text else json_out, hotspot=not args.no_hotspot).run()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+    finally:
+        if text:
+            sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

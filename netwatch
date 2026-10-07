@@ -1,0 +1,1669 @@
+#!/usr/bin/env python3
+# Netwatch — which application is using the network, right now.
+#
+# The window runs as you. Counting other programs' packets needs root, so it
+# starts netwatch-helper through pkexec (GNOME's password dialog) and reads one
+# JSON report per second from it. Closing the window closes the helper's stdin,
+# which is how the helper knows to exit — a process running as you cannot
+# signal a root one.
+#
+# Everything a process controls (its name, its command line) is shown as plain
+# text, never as Pango markup.
+
+import argparse
+import collections
+import json
+import os
+import random
+import re
+import shlex
+import signal
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gsk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gsk, Gtk, Pango  # noqa: E402
+
+try:
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix  # noqa: E402
+    DesktopAppInfo = GioUnix.DesktopAppInfo
+except (ValueError, ImportError):
+    DesktopAppInfo = Gio.DesktopAppInfo
+
+VERSION = "1.0.0"
+APP_ID = "local.netwatch.Netwatch"
+HELPER = "/usr/local/lib/netwatch/netwatch-helper"
+PROTOCOL = 1                     # must match the helper's
+HISTORY = 90                     # seconds shown in the graphs
+IDLE_AFTER = 15.0                # no traffic for this long: the row is dimmed / hidden
+FORGET_PROCESS_AFTER = 300.0     # process rows that have been quiet this long are dropped
+MAX_APP_ROWS = 150               # beyond this, the smallest quiet apps fold into one "earlier" row
+MAX_PROCS_PER_APP = 50           # an app remembers this many of its processes (most recent)
+DETAIL_ROWS = 50                 # processes listed in a details dialog
+PHONE_HINTS = ("iphone", "android", "galaxy", "redmi", "xiaomi", "poco", "pixel", "huawei", "honor",
+               "oppo", "vivo", "realme", "oneplus", "nokia", "phone", "samsung", "sm-", "moto", "infinix", "tecno")
+
+PALETTE = {                      # (light, dark) — Adwaita blue 4 / orange 5 and their dark variants
+    "down": ("#1c71d8", "#78aeed"),
+    "up": ("#c64600", "#ffa348"),
+}
+
+CSS = b"""
+.nw-down { color: #1c71d8; }
+.nw-up { color: #c64600; }
+@media (prefers-color-scheme: dark) {
+  .nw-down { color: #78aeed; }
+  .nw-up { color: #ffa348; }
+}
+.nw-card { padding: 14px 18px 8px 18px; }
+.nw-rate { font-size: 2.1em; font-weight: 700; }
+progressbar.nw-share > trough { min-height: 3px; }
+progressbar.nw-share > trough > progress { min-height: 3px; }
+row.nw-idle .nw-fade { opacity: 0.5; }
+.nw-colhead { padding: 2px 6px; min-height: 0; font-size: 0.85em; font-weight: 700; }
+.nw-colhead:not(.nw-sorted) { opacity: 0.6; }
+.nw-badge { font-size: 0.8em; font-weight: 700; padding: 1px 7px; border-radius: 99px;
+            background: alpha(currentColor, 0.12); }
+.nw-badge.error { color: @error_color; background: alpha(@error_color, 0.14); }
+.nw-badge.accent { color: @accent_color; background: alpha(@accent_color, 0.14); }
+.nw-badge.warning { color: @warning_color; background: alpha(@warning_color, 0.16); }
+.nw-stat-value { font-size: 1.5em; font-weight: 700; }
+levelbar.nw-quota > trough > block.filled { background-color: @accent_bg_color; }
+levelbar.nw-quota.nw-warn > trough > block.filled { background-color: @warning_bg_color; }
+levelbar.nw-quota.nw-full > trough > block.filled { background-color: @error_bg_color; }
+"""
+
+KIND_ICONS = {
+    "app": "application-x-executable-symbolic",
+    "process": "utilities-terminal-symbolic",
+    "service": "emblem-system-symbolic",
+    "user-service": "emblem-system-symbolic",
+    "container": "package-x-generic-symbolic",
+    "other": "network-wired-symbolic",
+}
+KIND_NAMES = {
+    "app": "Application",
+    "process": "Program",
+    "service": "System service",
+    "user-service": "Session service",
+    "container": "Docker container",
+    "other": "",
+}
+# Whole words only: "tor" must not match "webstorm".
+PROXY_CLIENT = re.compile(r"(?<![a-z0-9])(throne|nekoray|nekobox|v2ray|v2rayn|xray|sing-box|clash|"
+                          r"clash-verge|mihomo|hiddify|outline|psiphon|lantern|tor)(?![a-z0-9])")
+NOT_AN_APP = frozenset(("sh", "bash", "zsh", "dash", "env", "python", "python3", "node", "java",
+                        "flatpak", "snap", "gtk-launch", "xdg-open", "gio", "pkexec", "sudo", "perl"))
+
+
+# ── formatting ──────────────────────────────────────────────────────────────
+def _scaled(v, units):
+    i = 0
+    while v >= 999.5 and i < len(units) - 1:
+        v /= 1000.0
+        i += 1
+    if i == 0:
+        return "%d %s" % (round(v), units[0])
+    return ("%.1f %s" if v < 99.95 else "%.0f %s") % (v, units[i])
+
+
+def fmt_rate(bytes_per_s, bits=False):
+    if bits:
+        return _scaled(bytes_per_s * 8, ("bit/s", "kbit/s", "Mbit/s", "Gbit/s"))
+    return _scaled(bytes_per_s, ("B/s", "kB/s", "MB/s", "GB/s"))
+
+
+def fmt_bytes(n):
+    return _scaled(n, ("B", "kB", "MB", "GB", "TB"))
+
+
+def fmt_duration(seconds):
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return "%d s" % seconds
+    if seconds < 3600:
+        return "%d min" % (seconds // 60)
+    if seconds < 86400:
+        return "%d h %d min" % (seconds // 3600, seconds % 3600 // 60)
+    return "%d d %d h" % (seconds // 86400, seconds % 86400 // 3600)
+
+
+def signal_words(dbm):
+    if dbm is None:
+        return None
+    word = "excellent" if dbm >= -50 else "good" if dbm >= -60 else "fair" if dbm >= -70 else "weak"
+    return "%d dBm, %s" % (dbm, word)
+
+
+def device_name(d):
+    if d.get("name"):
+        return d["name"]
+    if d.get("hostname"):
+        return d["hostname"]
+    if d.get("vendor"):
+        return "%s device" % d["vendor"].split(",")[0].split(" ")[0]
+    return "Unknown device"
+
+
+def quota_bar(**props):
+    """A LevelBar for a daily limit: GTK's default offsets turn it green as it
+    fills (fuller = better, like a battery) — here fuller is worse."""
+    bar = Gtk.LevelBar(min_value=0, max_value=1, **props)
+    for name in (Gtk.LEVEL_BAR_OFFSET_LOW, Gtk.LEVEL_BAR_OFFSET_HIGH, Gtk.LEVEL_BAR_OFFSET_FULL):
+        bar.remove_offset_value(name)
+    bar.add_css_class("nw-quota")
+    return bar
+
+
+def set_quota_bar(bar, fraction):
+    bar.set_value(max(0.0, min(1.0, fraction)))
+    for css, on in (("nw-warn", 0.8 <= fraction < 1.0), ("nw-full", fraction >= 1.0)):
+        if on:
+            bar.add_css_class(css)
+        else:
+            bar.remove_css_class(css)
+
+
+def device_icon(d):
+    text = " ".join(filter(None, (d.get("name"), d.get("hostname"), d.get("vendor")))).lower()
+    return "phone-symbolic" if any(h in text for h in PHONE_HINTS) else "computer-symbolic"
+
+
+def rgba(hexcolor, alpha=1.0):
+    c = Gdk.RGBA()
+    c.parse(hexcolor)
+    c.alpha = alpha
+    return c
+
+
+# ── desktop names and icons ─────────────────────────────────────────────────
+class AppDirectory:
+    """Application ids → (display name, icon), from the installed .desktop files."""
+
+    def __init__(self):
+        self._cache = {}
+        self._by_exec = None
+
+    @staticmethod
+    def _desktop(desktop_id):
+        try:
+            return DesktopAppInfo.new(desktop_id + ".desktop")
+        except TypeError:        # constructor returned NULL: no such entry
+            return None
+
+    def _exec_index(self):
+        if self._by_exec is None:
+            self._by_exec = {}
+            for info in Gio.AppInfo.get_all():
+                exe = os.path.basename(info.get_executable() or "")
+                exe = exe[:-3] if exe.endswith(".sh") else exe
+                if exe and exe not in NOT_AN_APP:
+                    self._by_exec.setdefault(exe, info)
+        return self._by_exec
+
+    def lookup(self, app_id, program):
+        key = (app_id, program)
+        if key not in self._cache:
+            info = None
+            for cand in filter(None, (app_id, app_id.lower() if app_id else None)):
+                info = self._desktop(cand)
+                if info:
+                    break
+            if info is None and program and program not in NOT_AN_APP:
+                info = self._desktop(program) or self._exec_index().get(program)
+            self._cache[key] = (info.get_display_name(), info.get_icon()) if info else (None, None)
+        return self._cache[key]
+
+
+# ── the model ───────────────────────────────────────────────────────────────
+class Entry:
+    """One row: an application, or a single process when grouping by process."""
+
+    def __init__(self, key, kind, label, app_id=None, desc=None):
+        self.key, self.kind, self.label, self.app_id, self.desc = key, kind, label, app_id, desc
+        self.program = label
+        self.app_key = key       # for process rows: the application they belong to
+        self.via = None
+        self.cmd = ""
+        self.pid = 0
+        self.rx = self.tx = 0.0              # bytes per second, last interval
+        self.rx_total = self.tx_total = 0
+        self.last_active = 0.0
+        self.procs = {}                      # pid → dict (application rows only)
+        self.display = label
+        self.icon = None
+        self.row = None
+
+    def add(self, rx, tx, dt, now):
+        self.rx += rx / dt
+        self.tx += tx / dt
+        self.rx_total += rx
+        self.tx_total += tx
+        if rx or tx:
+            self.last_active = now
+
+    def idle(self, now):
+        return now - self.last_active > IDLE_AFTER
+
+
+# ── widgets ─────────────────────────────────────────────────────────────────
+class Sparkline(Gtk.Widget):
+    """The last HISTORY seconds as a filled line, drawn with GSK paths (no cairo)."""
+
+    def __init__(self, which):
+        super().__init__()
+        self.which = which
+        self.values = []
+        self.set_size_request(-1, 58)
+        self.set_hexpand(True)
+
+    def set_values(self, values):
+        self.values = list(values)
+        self.queue_draw()
+
+    def do_snapshot(self, snapshot):
+        w, h = self.get_width(), self.get_height()
+        if w <= 2 or h <= 2:
+            return
+        dark = Adw.StyleManager.get_default().get_dark()
+        color = PALETTE[self.which][1 if dark else 0]
+        base = Gsk.PathBuilder.new()
+        base.move_to(0, h - 0.5)
+        base.line_to(w, h - 0.5)
+        snapshot.append_stroke(base.to_path(), Gsk.Stroke.new(1), rgba("#ffffff" if dark else "#000000", 0.12))
+        vals = self.values[-HISTORY:]
+        if len(vals) < 2:
+            return
+        top = max(max(vals) * 1.15, 1.0)
+        step = w / (HISTORY - 1)
+        x0 = w - (len(vals) - 1) * step
+        pts = [(x0 + i * step, (h - 3) - (h - 6) * (v / top)) for i, v in enumerate(vals)]
+        fill = Gsk.PathBuilder.new()
+        fill.move_to(pts[0][0], h)
+        for x, y in pts:
+            fill.line_to(x, y)
+        fill.line_to(pts[-1][0], h)
+        fill.close()
+        snapshot.append_fill(fill.to_path(), Gsk.FillRule.WINDING, rgba(color, 0.18))
+        line = Gsk.PathBuilder.new()
+        line.move_to(*pts[0])
+        for x, y in pts[1:]:
+            line.line_to(x, y)
+        stroke = Gsk.Stroke.new(2.0)
+        stroke.set_line_join(Gsk.LineJoin.ROUND)
+        stroke.set_line_cap(Gsk.LineCap.ROUND)
+        snapshot.append_stroke(line.to_path(), stroke, rgba(color))
+
+
+class RateCard(Gtk.Box):
+    def __init__(self, title, icon_name, which):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        self.add_css_class("card")
+        self.add_css_class("nw-card")
+        head = Gtk.Box(spacing=6)
+        icon = Gtk.Image.new_from_icon_name(icon_name)
+        icon.add_css_class("nw-" + which)
+        label = Gtk.Label(label=title, xalign=0)
+        label.add_css_class("heading")
+        head.append(icon)
+        head.append(label)
+        self.rate = Gtk.Label(label="—", xalign=0)
+        self.rate.add_css_class("nw-rate")
+        self.rate.add_css_class("numeric")
+        self.rate.add_css_class("nw-" + which)
+        self.detail = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.detail.add_css_class("caption")
+        self.detail.add_css_class("dim-label")
+        self.detail.add_css_class("numeric")
+        self.graph = Sparkline(which)
+        self.graph.set_margin_top(6)
+        for w in (head, self.rate, self.detail, self.graph):
+            self.append(w)
+
+
+COLUMNS = (("rx", "↓ Now"), ("tx", "↑ Now"), ("rx_total", "↓ Total"), ("tx_total", "↑ Total"))
+
+
+class AppRow(Gtk.ListBoxRow):
+    def __init__(self, window, entry):
+        super().__init__(activatable=True)
+        self.entry = entry
+        box = Gtk.Box(spacing=12, margin_top=7, margin_bottom=7, margin_start=12, margin_end=12)
+        self.icon = Gtk.Image(pixel_size=32, valign=Gtk.Align.CENTER)
+        self.icon.add_css_class("nw-fade")
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True,
+                       valign=Gtk.Align.CENTER)
+        self.name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.name.add_css_class("heading")
+        self.name.add_css_class("nw-fade")
+        self.sub = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.sub.add_css_class("caption")
+        self.sub.add_css_class("dim-label")
+        self.bar = Gtk.ProgressBar(margin_top=3)
+        self.bar.add_css_class("nw-share")
+        for w in (self.name, self.sub, self.bar):
+            text.append(w)
+        box.append(self.icon)
+        box.append(text)
+        self.cells = []
+        for i, (field, _) in enumerate(COLUMNS):
+            cell = Gtk.Label(xalign=1)
+            cell.add_css_class("numeric")
+            cell.add_css_class("nw-fade")
+            cell.add_css_class("nw-down" if field.startswith("rx") and i == 0 else
+                               "nw-up" if field.startswith("tx") and i == 1 else "dim-label")
+            window.col_groups[i].add_widget(cell)
+            box.append(cell)
+            self.cells.append(cell)
+        self.set_child(box)
+
+    def update(self, window, now, share):
+        e = self.entry
+        bits = window.bits
+        self.name.set_text(e.display)
+        self.sub.set_text(window.subtitle(e))
+        if e.icon is not None:
+            self.icon.set_from_gicon(e.icon)
+        else:
+            self.icon.set_from_icon_name(KIND_ICONS.get(e.kind, KIND_ICONS["app"]))
+        idle = e.idle(now)
+        if idle:
+            self.add_css_class("nw-idle")
+        else:
+            self.remove_css_class("nw-idle")
+        self.bar.set_fraction(min(1.0, share))
+        self.bar.set_visible(share > 0.001)
+        quiet = e.rx < 0.5 and e.tx < 0.5
+        self.cells[0].set_text("—" if quiet else fmt_rate(e.rx, bits))
+        self.cells[1].set_text("—" if quiet else fmt_rate(e.tx, bits))
+        self.cells[2].set_text(fmt_bytes(e.rx_total))
+        self.cells[3].set_text(fmt_bytes(e.tx_total))
+        tip = [e.display]
+        if e.desc:
+            tip.append(e.desc)
+        if e.cmd:
+            tip.append(e.cmd)
+        self.set_tooltip_text("\n".join(tip))
+
+
+class DeviceRow(Gtk.ListBoxRow):
+    """One device on the hotspot."""
+
+    def __init__(self, window, mac):
+        super().__init__(activatable=True)
+        self.mac = mac
+        self.d = {}
+        box = Gtk.Box(spacing=12, margin_top=7, margin_bottom=7, margin_start=12, margin_end=12)
+        self.icon = Gtk.Image(pixel_size=32, valign=Gtk.Align.CENTER)
+        self.icon.add_css_class("nw-fade")
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, hexpand=True, valign=Gtk.Align.CENTER)
+        top = Gtk.Box(spacing=8)
+        self.name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.name.add_css_class("heading")
+        self.name.add_css_class("nw-fade")
+        self.badges = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+        top.append(self.name)
+        top.append(self.badges)
+        self.sub = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.sub.add_css_class("caption")
+        self.sub.add_css_class("dim-label")
+        self.quota = quota_bar(margin_top=2)
+        for w in (top, self.sub, self.quota):
+            text.append(w)
+        box.append(self.icon)
+        box.append(text)
+        self.cells = []
+        for i, css in enumerate(("nw-down", "nw-up", "dim-label")):
+            cell = Gtk.Label(xalign=1)
+            cell.add_css_class("numeric")
+            cell.add_css_class("nw-fade")
+            cell.add_css_class(css)
+            window.dev_groups[i].add_widget(cell)
+            box.append(cell)
+            self.cells.append(cell)
+        self.set_child(box)
+
+    def update(self, d, dt, bits):
+        self.d = d
+        self.name.set_text(device_name(d))
+        self.icon.set_from_icon_name(device_icon(d))
+        parts = [d["ip"] or "no address yet"]
+        parts.append(d["vendor"] or ("private address" if d["private_mac"] else "unknown maker"))
+        if d["connected"]:
+            if d.get("signal") is not None:
+                parts.append(signal_words(d["signal"]))
+            if d.get("connected_for"):
+                parts.append("connected %s" % fmt_duration(d["connected_for"]))
+        else:
+            parts.append("not connected" + (" · last seen %s" % time.strftime("%H:%M", time.localtime(d["last_seen"]))
+                                            if d.get("last_seen") else ""))
+        self.sub.set_text("  ·  ".join(parts))
+        if d["connected"]:
+            self.remove_css_class("nw-idle")
+        else:
+            self.add_css_class("nw-idle")
+
+        child = self.badges.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.badges.remove(child)
+            child = nxt
+        r = d["rules"]
+        badges = []
+        if r["blocked"]:
+            badges.append(("No internet", "error"))
+        if r["down"]:
+            badges.append(("↓ " + fmt_rate(r["down"]), "accent"))
+        if r["up"]:
+            badges.append(("↑ " + fmt_rate(r["up"]), "accent"))
+        if r["quota"]:
+            used = d.get("quota_used") or 0
+            badges.append(("Daily limit reached" if used >= r["quota"] else "Daily %s" % fmt_bytes(r["quota"]),
+                           "error" if used >= r["quota"] else "warning"))
+        for text, css in badges:
+            label = Gtk.Label(label=text)
+            label.add_css_class("nw-badge")
+            label.add_css_class(css)
+            self.badges.append(label)
+        self.quota.set_visible(bool(r["quota"]))
+        if r["quota"]:
+            set_quota_bar(self.quota, (d.get("quota_used") or 0) / r["quota"])
+        quiet = not d["now_down"] and not d["now_up"]
+        self.cells[0].set_text("—" if quiet else fmt_rate(d["now_down"] / dt, bits))
+        self.cells[1].set_text("—" if quiet else fmt_rate(d["now_up"] / dt, bits))
+        self.cells[2].set_text(fmt_bytes(d["today_up"] + d["today_down"]))
+
+
+# ── the helper process ──────────────────────────────────────────────────────
+class HelperClient:
+    """Runs the helper, hands each JSON line to on_message, sends commands to
+    its stdin, and calls on_exit once the process has exited AND both of its
+    output pipes are drained — so a last {"type": "error"} line is never lost.
+    Nothing a report contains can stop the reading: a bad line is skipped and
+    an exception while handling one is printed, not allowed to end the loop
+    (a stalled reader would leave the helper blocked on a full pipe)."""
+
+    def __init__(self, argv, on_message, on_exit):
+        self.on_message, self.on_exit = on_message, on_exit
+        self.proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDIN_PIPE |
+                                       Gio.SubprocessFlags.STDOUT_PIPE |
+                                       Gio.SubprocessFlags.STDERR_PIPE)
+        # Raw chunks, split into lines here: DataInputStream.read_line_finish()
+        # returns b"" both for an empty line and for end-of-stream, so a reader
+        # built on it can never tell that the helper has gone.
+        self.out = self.proc.get_stdout_pipe()
+        self.buf = b""
+        self.err = self.proc.get_stderr_pipe()
+        self.stderr = b""
+        self.pending = 3                     # stdout EOF, stderr EOF, process exit
+        self.detached = False                # stopped on purpose: report nothing more
+        self.status = None
+        self.last_error = None
+        self.next_id = 0
+        self.waiting = {}                    # command id → callback(ack)
+        self.out.read_bytes_async(1 << 16, GLib.PRIORITY_DEFAULT, None, self._chunk)
+        self.err.read_bytes_async(4096, GLib.PRIORITY_DEFAULT, None, self._stderr)
+        self.proc.wait_async(None, self._exited)
+
+    def _done(self):
+        self.pending -= 1
+        if self.pending == 0 and not self.detached:
+            self.on_exit(self.status, self.stderr.decode("utf-8", "replace").strip(), self.last_error)
+
+    def _chunk(self, stream, result):
+        try:
+            data = stream.read_bytes_finish(result).get_data()
+        except GLib.Error:
+            data = b""
+        if not data:                         # size 0 is end-of-stream, unambiguously
+            self._done()
+            return
+        try:
+            self.buf += data
+            *lines, self.buf = self.buf.split(b"\n")
+            if len(self.buf) > 8 << 20:      # no report is this long: drop it
+                self.buf = b""
+            for line in lines:
+                if line.strip() and not self.detached:
+                    try:
+                        self._dispatch(line)
+                    except Exception:        # noqa: BLE001 — one bad report must not end the reading
+                        import traceback
+                        traceback.print_exc()
+        finally:
+            self.out.read_bytes_async(1 << 16, GLib.PRIORITY_DEFAULT, None, self._chunk)
+
+    def _dispatch(self, line):
+        try:
+            msg = json.loads(bytes(line).decode("utf-8", "replace"))
+        except ValueError:
+            return
+        if not isinstance(msg, dict):
+            return
+        if msg.get("type") == "ack":
+            callback = self.waiting.pop(msg.get("id"), None)
+            if callback is not None:
+                callback(msg)
+            return
+        if msg.get("type") == "error":
+            self.last_error = str(msg.get("message", ""))
+        self.on_message(msg)
+
+    def send(self, command, callback):
+        """One command to the helper; callback(ack) when it answers."""
+        self.next_id += 1
+        command = dict(command, id=self.next_id)
+        self.waiting[self.next_id] = callback
+        try:
+            self.proc.get_stdin_pipe().write_all((json.dumps(command) + "\n").encode(), None)
+        except GLib.Error as e:
+            self.waiting.pop(self.next_id, None)
+            callback({"type": "ack", "ok": False, "error": e.message})
+
+    def _stderr(self, stream, result):
+        try:
+            data = stream.read_bytes_finish(result).get_data()
+        except GLib.Error:
+            data = b""
+        if not data:
+            self._done()
+            return
+        self.stderr = (self.stderr + data)[-8192:]
+        self.err.read_bytes_async(4096, GLib.PRIORITY_DEFAULT, None, self._stderr)
+
+    def _exited(self, proc, result):
+        try:
+            proc.wait_finish(result)
+        except GLib.Error:
+            pass
+        self.status = proc.get_exit_status() if proc.get_if_exited() else -1
+        for callback in self.waiting.values():
+            callback({"type": "ack", "ok": False, "error": "the helper stopped"})
+        self.waiting = {}
+        self._done()
+
+    def stop(self):
+        """Close the helper's stdin — it exits on EOF. Its output is still read
+        to the end (so it never blocks on a full pipe), but nothing more is reported."""
+        self.detached = True
+        self.waiting = {}
+        pipe = self.proc.get_stdin_pipe()
+        if pipe is not None and not pipe.is_closed():
+            try:
+                pipe.close(None)
+            except GLib.Error:
+                pass
+
+
+class DemoSource:
+    """Synthetic reports for `netwatch --demo`: the window without root."""
+
+    APPS = {
+        "app:google-chrome": {"kind": "app", "label": "google-chrome", "app_id": "google-chrome", "desc": None},
+        "svc:snapd": {"kind": "service", "label": "snapd", "app_id": None,
+                      "desc": "Snap store — installs and automatic snap refreshes"},
+        "proc:1000:npm": {"kind": "process", "label": "npm", "app_id": None, "desc": None},
+        "app:termius-app_termius-app": {"kind": "app", "label": "termius-app", "app_id": "termius-app_termius-app", "desc": None},
+        "app:jetbrains-webstorm": {"kind": "app", "label": "jetbrains-webstorm", "app_id": "jetbrains-webstorm", "desc": None},
+        "app:telegram-desktop_telegram-desktop": {"kind": "app", "label": "telegram-desktop",
+                                                  "app_id": "telegram-desktop_telegram-desktop", "desc": None},
+        "svc:docker": {"kind": "service", "label": "docker", "app_id": None,
+                       "desc": "Docker engine — image pulls and pushes"},
+        "svc:systemd-resolved": {"kind": "service", "label": "systemd-resolved", "app_id": None,
+                                 "desc": "DNS lookups for the whole system"},
+        "other:unattributed": {"kind": "other", "label": "Unattributed", "app_id": None,
+                               "desc": "Traffic no running program owns: connections that already closed, "
+                                       "Docker containers (NAT hides which one) and the kernel itself"},
+        "other:hotspot": {"kind": "other", "label": "Hotspot devices", "app_id": None,
+                          "desc": "Phones and computers on this computer's hotspot — each one is in the Hotspot tab"},
+    }
+    DEVICES = {
+        "a6:3f:12:20:fb:85": dict(hostname="Alis-iPhone", ip="10.42.0.85", vendor=None, private_mac=True,
+                                  signal=-44, connected_for=15100, link_mbps=144.4, rate=(1.9e6, 9e4)),
+        "dc:a6:32:e4:51:8d": dict(hostname="Galaxy-A54", ip="10.42.0.215", vendor=None, private_mac=True,
+                                  signal=-52, connected_for=9700, link_mbps=86.7, rate=(0.98e6, 4e4),
+                                  rules=dict(down=1_000_000)),
+        "3c:22:fb:51:ae:e4": dict(hostname="reza-laptop", ip="10.42.0.124", vendor="Intel Corporate",
+                                  private_mac=False, signal=-66, connected_for=4700, link_mbps=26.0,
+                                  rate=(2.1e5, 3e4), rules=dict(quota=500_000_000), used=412_000_000),
+        "8e:11:aa:00:12:34": dict(hostname=None, ip="10.42.0.40", vendor=None, private_mac=True, name="Guest",
+                                  connected=False, rules=dict(blocked=True), used=31_000_000),
+    }
+    PROCS = [
+        ("app:google-chrome", 4021, "chrome", "/opt/google/chrome/chrome --type=utility --utility-sub-type=network.mojom.NetworkService", None),
+        ("svc:snapd", 812, "snapd", "/usr/lib/snapd/snapd", None),
+        ("proc:1000:npm", 90211, "node", "node /usr/lib/node_modules/npm/bin/npm-cli.js install", "jetbrains-webstorm"),
+        ("app:termius-app_termius-app", 5120, "termius-app", "/snap/termius-app/268/termius-app", None),
+        ("app:jetbrains-webstorm", 6633, "java", "/opt/webstorm/jbr/bin/java -classpath …", None),
+        ("app:telegram-desktop_telegram-desktop", 7010, "telegram-desktop", "/snap/telegram-desktop/6702/usr/bin/telegram-desktop", None),
+        ("svc:docker", 1402, "dockerd", "/usr/bin/dockerd -H fd://", None),
+        ("svc:systemd-resolved", 640, "systemd-resolve", "/usr/lib/systemd/systemd-resolved", None),
+    ]
+
+    def __init__(self, on_message):
+        self.on_message = on_message
+        self.t = 0
+        self.rng = random.Random(7)
+        self.devices = {}
+        for mac, spec in self.DEVICES.items():
+            rules = dict(blocked=False, up=None, down=None, quota=None)
+            rules.update(spec.get("rules", {}))
+            used = spec.get("used", 0)
+            self.devices[mac] = dict(mac=mac, hostname=spec["hostname"], ip=spec["ip"], vendor=spec["vendor"],
+                                     private_mac=spec["private_mac"], name=spec.get("name"),
+                                     connected=spec.get("connected", True), signal=spec.get("signal"),
+                                     connected_for=spec.get("connected_for"), link_mbps=spec.get("link_mbps"),
+                                     inactive_ms=50, iface="wlo1", ssid="raounix2",
+                                     last_seen=time.time() - (7200 if not spec.get("connected", True) else 0),
+                                     today_up=used // 8, today_down=used - used // 8, rules=rules,
+                                     rate=spec.get("rate", (0, 0)))
+        self.sources = [GLib.idle_add(self._hello), GLib.timeout_add(1000, self._tick)]
+
+    def _hello(self):
+        self.sources.pop(0)                  # a one-shot source is gone once it returns False
+        self.on_message({"type": "hello", "protocol": PROTOCOL, "version": "demo", "interval": 1.0,
+                         "ifaces": [{"name": "enp45s0", "kind": "physical", "uplink": True}]})
+        return False
+
+    def _tick(self):
+        self.t += 1
+        r, t = self.rng, self.t
+        load = {
+            "app:google-chrome": (2.6e6 + 1.2e6 * abs((t % 30) - 15) / 15 + r.random() * 4e5, 4.0e4),
+            "svc:snapd": ((7.5e6 if 20 <= t % 60 < 34 else 0) + r.random() * 2e3, 6e3 if 20 <= t % 60 < 34 else 0),
+            "proc:1000:npm": ((1.4e6 * r.random() if t % 45 < 12 else 0), 2e4 if t % 45 < 12 else 0),
+            "app:termius-app_termius-app": (3e3 + r.random() * 2e3, 2.5e3 + r.random() * 1.5e3),
+            "app:jetbrains-webstorm": (r.random() * 6e4 if t % 9 == 0 else 0, r.random() * 2e4 if t % 9 == 0 else 0),
+            "app:telegram-desktop_telegram-desktop": (8e3 + r.random() * 6e4, 1.2e5 if t % 20 < 3 else 4e3),
+            "svc:docker": ((3.1e6 if 5 <= t % 80 < 25 else 0), 1.5e4 if 5 <= t % 80 < 25 else 0),
+            "svc:systemd-resolved": (r.random() * 2e3, r.random() * 1e3),
+        }
+        procs, rx, tx = [], 0, 0
+        for app, pid, comm, cmd, via in self.PROCS:
+            a, b = (int(v) for v in load[app])
+            if a or b:
+                procs.append({"pid": pid, "start": 1000 + pid, "comm": comm, "cmd": cmd, "user": "raounix",
+                              "app": app, "via": via, "rx": a, "tx": b})
+                rx, tx = rx + a, tx + b
+        ua, ub = int(r.random() * 6e3), int(r.random() * 3e3)
+        procs.append({"pid": 0, "start": 0, "comm": "", "cmd": "", "user": "", "app": "other:unattributed",
+                      "via": None, "rx": ua, "tx": ub})
+        devices, hd, hu = [], 0, 0
+        for d in self.devices.values():
+            r_ = d["rules"]
+            down, up = d["rate"]
+            if not d["connected"] or r_["blocked"]:
+                down = up = 0
+            if r_["down"]:
+                down = min(down, r_["down"])
+            if r_["up"]:
+                up = min(up, r_["up"])
+            if r_["quota"] and d["today_up"] + d["today_down"] >= r_["quota"]:
+                down = up = 0
+            down, up = int(down * (0.7 + 0.6 * r.random())), int(up * (0.7 + 0.6 * r.random()))
+            if r_["down"]:
+                down = min(down, r_["down"])
+            d["today_down"] += down
+            d["today_up"] += up
+            if d["connected"] and d["connected_for"]:
+                d["connected_for"] += 1
+            hd, hu = hd + down, hu + up
+            devices.append(dict({k: v for k, v in d.items() if k != "rate"}, now_down=down, now_up=up,
+                                quota_used=(d["today_up"] + d["today_down"]) if r_["quota"] else None,
+                                rules=dict(r_)))
+        if hd or hu:
+            procs.append({"pid": 0, "start": 0, "comm": "", "cmd": "", "user": "", "app": "other:hotspot",
+                          "via": None, "rx": hd, "tx": hu})
+            rx, tx = rx + hd, tx + hu
+        self.on_message({"type": "tick", "seq": t, "dt": 1.0, "rx": rx + ua, "tx": tx + ub, "drops": 0,
+                         "ifaces": [{"name": "enp45s0", "kind": "physical", "uplink": True,
+                                     "rx": rx + ua, "tx": tx + ub}],
+                         "procs": procs, "apps": {p["app"]: self.APPS[p["app"]] for p in procs},
+                         "hotspot": {"active": True, "controls": True, "error": None,
+                                     "ifaces": [{"name": "wlo1", "ssid": "raounix2", "freq": 2412, "wifi": True}],
+                                     "devices": devices}})
+        return True
+
+    def send(self, command, callback):
+        d = self.devices.get(command.get("mac"))
+        ack = {"type": "ack", "ok": d is not None, "error": None if d else "unknown device"}
+        if d is not None:
+            if command["cmd"] == "set_device":
+                d["rules"] = {k: command.get(k) for k in ("blocked", "up", "down", "quota")}
+                d["name"] = command.get("name")
+            elif command["cmd"] == "reset_today":
+                d["today_up"] = d["today_down"] = 0
+            elif command["cmd"] == "disconnect":
+                d["connected"] = False
+                d["last_seen"] = time.time()
+        GLib.timeout_add(150, lambda: (callback(ack), False)[1])
+
+    def stop(self):
+        for source in self.sources:
+            GLib.source_remove(source)
+        self.sources = []
+
+
+# ── the window ──────────────────────────────────────────────────────────────
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, options):
+        super().__init__(application=app, title="Netwatch", default_width=1040, default_height=760)
+        self.options = options
+        self.directory = AppDirectory()
+        self.client = None
+        self.apps = {}                       # application key → Entry
+        self.pids = {}                       # "pid:N" → Entry
+        self.group = "app"
+        self.bits = False
+        self.show_idle = True
+        self.paused = False
+        self.sort_key = "activity"
+        self.hist_rx = collections.deque(maxlen=HISTORY)
+        self.hist_tx = collections.deque(maxlen=HISTORY)
+        self.total_rx = self.total_tx = 0
+        self.peak_rx = self.peak_tx = 0.0
+        self.ifaces = []
+        self.last_drop_at = -1e9
+        self.col_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in COLUMNS]
+        self.dev_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(3)]
+        self.dev_rows = {}                   # mac → DeviceRow
+        self.hotspot = None                  # the last hotspot report
+        self.last_dt = 1.0
+
+        self._actions()
+        self.views = Adw.ViewStack()
+        self.views.add_titled_with_icon(self._dashboard(), "apps", "Applications", "network-transmit-receive-symbolic")
+        self.hs_page = self.views.add_titled_with_icon(self._hotspot_page(), "hotspot", "Hotspot",
+                                                       "network-wireless-hotspot-symbolic")
+        self.switcher = Adw.ViewSwitcher(stack=self.views, policy=Adw.ViewSwitcherPolicy.WIDE)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.add_named(self.views, "main")
+        self.stack.add_named(self._status_page("start"), "start")
+        self.stack.add_named(self._status_page("waiting"), "waiting")
+        self.stack.add_named(self._status_page("error"), "error")
+
+        self.title = Adw.WindowTitle(title="Netwatch", subtitle="")
+        header = self.header = Adw.HeaderBar(title_widget=self.title)
+        self.pause_button = Gtk.ToggleButton(icon_name="media-playback-pause-symbolic",
+                                             action_name="win.pause", tooltip_text="Freeze the view (Ctrl+P)")
+        reset = Gtk.Button(icon_name="edit-clear-all-symbolic", action_name="win.reset",
+                           tooltip_text="Reset session totals (Ctrl+R)")
+        menu = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=self._menu(),
+                              tooltip_text="Main menu", primary=True)
+        header.pack_end(menu)
+        header.pack_end(self.pause_button)
+        header.pack_start(reset)
+        self.header_controls = (self.pause_button, reset)
+
+        self.banner = Adw.Banner(revealed=False, use_markup=False)
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        top.append(self.banner)
+        top.append(self.stack)
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.set_content(top)
+        self.toasts = Adw.ToastOverlay(child=view)
+        self.set_content(self.toasts)
+        self.connect("close-request", self._on_close)
+        self._show("start")
+
+    # ui construction -------------------------------------------------------
+    def _actions(self):
+        def stateful(name, vtype, value, handler):
+            act = Gio.SimpleAction.new_stateful(name, GLib.VariantType.new(vtype) if vtype else None, value)
+            act.connect("change-state", handler)
+            self.add_action(act)
+
+        stateful("group", "s", GLib.Variant("s", "app"), self._on_group)
+        stateful("units", "s", GLib.Variant("s", "bytes"), self._on_units)
+        stateful("show-idle", None, GLib.Variant("b", True), self._on_show_idle)
+        stateful("pause", None, GLib.Variant("b", False), self._on_pause)
+        reset = Gio.SimpleAction.new("reset", None)
+        reset.connect("activate", lambda *_: self.reset_totals())
+        self.add_action(reset)
+
+    def _menu(self):
+        menu = Gio.Menu()
+        group = Gio.Menu()
+        group.append("Group by application", "win.group::app")
+        group.append("Show every process", "win.group::process")
+        units = Gio.Menu()
+        units.append("Bytes per second (MB/s)", "win.units::bytes")
+        units.append("Bits per second (Mbit/s)", "win.units::bits")
+        view = Gio.Menu()
+        view.append("Keep idle apps in the list", "win.show-idle")
+        view.append("Reset session totals", "win.reset")
+        about = Gio.Menu()
+        about.append("About Netwatch", "app.about")
+        for section in (group, units, view, about):
+            menu.append_section(None, section)
+        return menu
+
+    def _dashboard(self):
+        self.down = RateCard("Download", "go-down-symbolic", "down")
+        self.up = RateCard("Upload", "go-up-symbolic", "up")
+        cards = Gtk.Box(spacing=12, homogeneous=True)
+        cards.append(self.down)
+        cards.append(self.up)
+
+        head = Gtk.Box(spacing=12, margin_start=12, margin_end=12)
+        spacer = Gtk.Box(width_request=32)
+        head.append(spacer)
+        self.sort_buttons = {}
+        name = self._column_button("name", "Application")
+        name.set_hexpand(True)
+        name.get_child().set_xalign(0)
+        head.append(name)
+        for i, (field, title) in enumerate(COLUMNS):
+            b = self._column_button(field, title)
+            b.get_child().set_xalign(1)
+            b.set_size_request(104, -1)          # room for "999.9 kbit/s", so columns don't jump
+            self.col_groups[i].add_widget(b)
+            head.append(b)
+
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.list.add_css_class("boxed-list")
+        self.list.set_sort_func(self._sort)
+        self.list.set_filter_func(self._filter)
+        self.list.connect("row-activated", lambda _l, row: self.show_details(row.entry))
+        self.hovering = False
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda *_: setattr(self, "hovering", True))
+        motion.connect("leave", lambda *_: (setattr(self, "hovering", False), self.list.invalidate_sort()))
+        self.list.add_controller(motion)
+        placeholder = Gtk.Label(label="No network traffic yet", margin_top=24, margin_bottom=24)
+        placeholder.add_css_class("dim-label")
+        self.list.set_placeholder(placeholder)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
+        self.caption = Gtk.Label(xalign=0)
+        self.caption.add_css_class("caption")
+        self.caption.add_css_class("dim-label")
+        body.append(self.caption)
+        body.append(cards)
+        body.append(head)
+        body.append(self.list)
+        clamp = Adw.Clamp(maximum_size=1180, child=body)
+        scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.set_child(clamp)
+        return scroller
+
+    def _hotspot_page(self):
+        self.hs_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        off = Adw.StatusPage(icon_name="network-wireless-hotspot-symbolic", title="Hotspot is off")
+        off.set_description(
+            "Turn on Wi-Fi Hotspot in Settings → Wi-Fi to share this computer's internet. The devices that "
+            "join show up here, with what they use — and you can cut any of them off, or limit its speed "
+            "and how much it may use per day.")
+        settings = Gtk.Button(label="Open Wi-Fi Settings", halign=Gtk.Align.CENTER)
+        settings.add_css_class("pill")
+        settings.connect("clicked", lambda *_: self._open_wifi_settings())
+        off.set_child(settings)
+        self.hs_stack.add_named(off, "off")
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       margin_top=12, margin_bottom=24, margin_start=18, margin_end=18)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        card.add_css_class("card")
+        card.add_css_class("nw-card")
+        self.hs_name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.hs_name.add_css_class("title-2")
+        self.hs_info = Gtk.Label(xalign=0, wrap=True)
+        self.hs_info.add_css_class("dim-label")
+        stats = Gtk.Box(homogeneous=True, spacing=12, margin_top=8, margin_bottom=6)
+        self.hs_stats = []
+        for title, css in (("Download now", "nw-down"), ("Upload now", "nw-up"), ("Used today", None)):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            label = Gtk.Label(label=title, xalign=0)
+            label.add_css_class("caption")
+            label.add_css_class("dim-label")
+            value = Gtk.Label(label="—", xalign=0)
+            value.add_css_class("nw-stat-value")
+            value.add_css_class("numeric")
+            if css:
+                value.add_css_class(css)
+            box.append(label)
+            box.append(value)
+            stats.append(box)
+            self.hs_stats.append(value)
+        for w in (self.hs_name, self.hs_info, stats):
+            card.append(w)
+        self.hs_notice = Gtk.Label(xalign=0, wrap=True, visible=False)
+        self.hs_notice.add_css_class("warning")
+
+        head = Gtk.Box(spacing=12, margin_start=12, margin_end=12)
+        head.append(Gtk.Box(width_request=32))
+        title = Gtk.Label(label="Device", xalign=0, hexpand=True)
+        title.add_css_class("nw-colhead")
+        head.append(title)
+        for i, text in enumerate(("↓ Now", "↑ Now", "Today")):
+            label = Gtk.Label(label=text, xalign=1, width_request=104)
+            label.add_css_class("nw-colhead")
+            self.dev_groups[i].add_widget(label)
+            head.append(label)
+        self.dev_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.dev_list.add_css_class("boxed-list")
+        self.dev_list.set_sort_func(self._sort_devices)
+        self.dev_list.connect("row-activated", lambda _l, row: self.show_device(row.mac))
+        self.dev_hovering = False
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda *_: setattr(self, "dev_hovering", True))
+        motion.connect("leave", lambda *_: (setattr(self, "dev_hovering", False), self.dev_list.invalidate_sort()))
+        self.dev_list.add_controller(motion)
+        placeholder = Gtk.Label(label="No device has joined yet", margin_top=24, margin_bottom=24)
+        placeholder.add_css_class("dim-label")
+        self.dev_list.set_placeholder(placeholder)
+        hint = Gtk.Label(xalign=0, wrap=True, label="Click a device to name it, cut it off, or limit its speed "
+                         "and daily data. Limits are enforced by the kernel and stay on while Netwatch is closed.")
+        hint.add_css_class("caption")
+        hint.add_css_class("dim-label")
+        for w in (card, self.hs_notice, head, self.dev_list, hint):
+            body.append(w)
+        scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.set_child(Adw.Clamp(maximum_size=1180, child=body))
+        self.hs_stack.add_named(scroller, "on")
+        return self.hs_stack
+
+    def _open_wifi_settings(self):
+        try:
+            Gio.Subprocess.new(["gnome-control-center", "wifi"], Gio.SubprocessFlags.NONE)
+        except GLib.Error as e:
+            self.toast("Could not open Settings: %s" % e.message)
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=4))
+
+    def on_hotspot(self, hs):
+        self.hotspot = hs
+        if hs is None or self.paused:
+            return
+        dt = self.last_dt
+        devices = hs.get("devices", [])
+        on = [d for d in devices if d["connected"]]
+        self.hs_page.set_badge_number(len(on))
+        if not hs["active"] and not devices:
+            self.hs_stack.set_visible_child_name("off")
+            return
+        self.hs_stack.set_visible_child_name("on")
+        if hs["active"]:
+            first = hs["ifaces"][0]
+            self.hs_name.set_text(first["ssid"] or "Shared connection")
+            bits = []
+            for i in hs["ifaces"]:
+                band = ""
+                if i.get("freq"):
+                    band = " · %s GHz" % ("2.4" if i["freq"] < 3000 else "5" if i["freq"] < 5925 else "6")
+                bits.append(i["name"] + band)
+            bits.append("%d device%s connected" % (len(on), "" if len(on) == 1 else "s"))
+            self.hs_info.set_text("  ·  ".join(bits))
+        else:
+            self.hs_name.set_text("Hotspot is off")
+            self.hs_info.set_text("Today's usage and the limits you set are kept for when it is back on.")
+        self.hs_stats[0].set_text(fmt_rate(sum(d["now_down"] for d in devices) / dt, self.bits))
+        self.hs_stats[1].set_text(fmt_rate(sum(d["now_up"] for d in devices) / dt, self.bits))
+        self.hs_stats[2].set_text(fmt_bytes(sum(d["today_up"] + d["today_down"] for d in devices)))
+        if not hs.get("controls"):
+            self.hs_notice.set_text("Blocking and limits are not available: %s" % (hs.get("error") or "unknown reason"))
+        self.hs_notice.set_visible(not hs.get("controls"))
+
+        seen = set()
+        for d in devices:
+            seen.add(d["mac"])
+            row = self.dev_rows.get(d["mac"])
+            if row is None:
+                row = self.dev_rows[d["mac"]] = DeviceRow(self, d["mac"])
+                self.dev_list.append(row)
+            row.update(d, dt, self.bits)
+        for mac in [m for m in self.dev_rows if m not in seen]:
+            self.dev_list.remove(self.dev_rows.pop(mac))
+        if not self.dev_hovering:
+            self.dev_list.invalidate_sort()
+
+    @staticmethod
+    def _sort_devices(a, b):
+        da, db = a.d, b.d
+        ka = (not da.get("connected"), -(da.get("now_down", 0) + da.get("now_up", 0)),
+              -(da.get("today_up", 0) + da.get("today_down", 0)), device_name(da).lower()) if da else (True,)
+        kb = (not db.get("connected"), -(db.get("now_down", 0) + db.get("now_up", 0)),
+              -(db.get("today_up", 0) + db.get("today_down", 0)), device_name(db).lower()) if db else (True,)
+        return (ka > kb) - (ka < kb)
+
+    def send(self, command, callback):
+        if self.client is None or not hasattr(self.client, "send"):
+            callback({"ok": False, "error": "monitoring is not running"})
+            return
+        self.client.send(command, callback)
+
+    def show_device(self, mac):
+        """A device's details, and the controls over it."""
+        d = next((x for x in (self.hotspot or {}).get("devices", []) if x["mac"] == mac), None)
+        if d is None:
+            return
+        controls = bool(self.hotspot.get("controls"))
+        rules = d["rules"]
+        dialog = Adw.Dialog(title=device_name(d), content_width=560, content_height=760)
+        save = Gtk.Button(label="Save", sensitive=False)
+        save.add_css_class("suggested-action")
+        header = Adw.HeaderBar()
+        header.pack_end(save)
+        problem = Adw.Banner(revealed=False, use_markup=False)
+        page = Adw.PreferencesPage()
+
+        access = Adw.PreferencesGroup(title="Access")
+        if not controls:
+            access.set_description("Not available: %s" % (self.hotspot.get("error") or "unknown reason"))
+        internet = Adw.SwitchRow(title="Internet access", active=not rules["blocked"],
+                                 subtitle="Off: it stays on the Wi-Fi but cannot reach the internet")
+
+        def spin(title, subtitle, value, upper, step, digits):
+            row = Adw.SpinRow.new_with_range(0, upper, step)
+            row.set_title(title)
+            row.set_subtitle(subtitle)
+            row.set_digits(digits)
+            row.set_value(value)
+            return row
+
+        down = spin("Download speed limit", "MB/s — 0 means no limit", (rules["down"] or 0) / 1e6, 1000, 0.1, 1)
+        up = spin("Upload speed limit", "MB/s — 0 means no limit", (rules["up"] or 0) / 1e6, 1000, 0.1, 1)
+        quota = spin("Daily data limit", "MB per day — 0 means no limit", (rules["quota"] or 0) / 1e6,
+                     10_000_000, 100, 0)
+
+        def quota_hint(*_):
+            mb = quota.get_value()
+            quota.set_subtitle("MB per day — 0 means no limit" if mb == 0 else
+                               "MB per day  (= %s)" % fmt_bytes(mb * 1e6))
+        quota.connect("notify::value", quota_hint)
+        quota_hint()
+        for row in (internet, down, up, quota):
+            access.add(row)
+        access.set_sensitive(controls)
+        page.add(access)
+
+        about = Adw.PreferencesGroup(title="Device")
+        name = Adw.EntryRow(title="Your name for it", text=d.get("name") or "")
+        about.add(name)
+
+        def info(title, value, selectable=False):
+            if value:
+                row = Adw.ActionRow(title=title, subtitle=str(value), use_markup=False,
+                                    subtitle_selectable=selectable)
+                row.add_css_class("property")
+                about.add(row)
+
+        info("Calls itself", d.get("hostname"))
+        info("IP address", d.get("ip"), True)
+        info("MAC address", d["mac"] + ("  (private: changes per network)" if d.get("private_mac") else ""), True)
+        info("Maker", d.get("vendor"))
+        if d["connected"]:
+            info("Signal", signal_words(d.get("signal")))
+            info("Connected for", fmt_duration(d["connected_for"]) if d.get("connected_for") else None)
+            info("Link speed", "%g Mbit/s" % d["link_mbps"] if d.get("link_mbps") else None)
+        else:
+            info("Status", "Not connected")
+        info("Network", d.get("ssid") or d.get("iface"))
+
+        usage = Adw.PreferencesGroup(title="Today")
+        for title, value in (("Downloaded", d["today_down"]), ("Uploaded", d["today_up"]),
+                             ("Total", d["today_down"] + d["today_up"])):
+            row = Adw.ActionRow(title=title, use_markup=False)
+            row.add_suffix(Gtk.Label(label=fmt_bytes(value), css_classes=["numeric"]))
+            usage.add(row)
+        if rules["quota"]:
+            used = d.get("quota_used") or 0
+            row = Adw.ActionRow(title="Daily limit", subtitle="%s of %s used" % (fmt_bytes(used), fmt_bytes(rules["quota"])),
+                                use_markup=False)
+            bar = quota_bar(width_request=140, valign=Gtk.Align.CENTER)
+            set_quota_bar(bar, used / rules["quota"])
+            row.add_suffix(bar)
+            usage.add(row)
+        page.add(usage)
+        page.add(about)
+
+        actions = Adw.PreferencesGroup()
+        reset = Adw.ButtonRow(title="Reset today's usage")
+        kick = Adw.ButtonRow(title="Disconnect it from the Wi-Fi")
+        kick.add_css_class("destructive-action")
+        actions.add(reset)
+        if d["connected"] and d.get("signal") is not None:
+            actions.add(kick)
+        actions.set_sensitive(controls)
+        page.add(actions)
+
+        def changed(*_):
+            save.set_sensitive(controls)
+        name.connect("changed", changed)
+        internet.connect("notify::active", changed)
+        for row in (down, up, quota):
+            row.connect("notify::value", changed)
+
+        def answered(ack, done_text, close):
+            if ack.get("ok"):
+                self.toast(done_text)
+                if close:
+                    dialog.close()
+            else:
+                problem.set_title(ack.get("error") or "It did not work")
+                problem.set_revealed(True)
+                save.set_sensitive(controls)
+
+        def on_save(*_):
+            save.set_sensitive(False)
+
+            def amount(row, minimum):
+                v = int(round(row.get_value() * 1e6))
+                return max(v, minimum) if v > 0 else None
+            self.send({"cmd": "set_device", "mac": mac, "blocked": not internet.get_active(),
+                       "down": amount(down, 10_000), "up": amount(up, 10_000), "quota": amount(quota, 1_000_000),
+                       "name": name.get_text().strip() or None},
+                      lambda ack: answered(ack, "Saved — %s" % (name.get_text().strip() or device_name(d)), True))
+        save.connect("clicked", on_save)
+        reset.connect("activated", lambda *_: self.send(
+            {"cmd": "reset_today", "mac": mac}, lambda ack: answered(ack, "Today's usage reset", True)))
+        kick.connect("activated", lambda *_: self.send(
+            {"cmd": "disconnect", "mac": mac},
+            lambda ack: answered(ack, "Disconnected — it may join again unless its access is off", True)))
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(problem)
+        box.append(page)
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.set_content(box)
+        dialog.set_child(view)
+        dialog.present(self)
+
+    def _column_button(self, field, title):
+        b = Gtk.Button(label=title)
+        b.add_css_class("flat")
+        b.add_css_class("nw-colhead")
+        b.connect("clicked", lambda *_: self.set_sort(field))
+        self.sort_buttons[field] = (b, title)
+        return b
+
+    def _status_page(self, which):
+        page = Adw.StatusPage()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, halign=Gtk.Align.CENTER)
+        if which == "start":
+            page.set_icon_name("network-transmit-receive-symbolic")
+            page.set_title("See which apps use your network")
+            page.set_description(
+                "Netwatch reads the headers of every packet to measure each application. "
+                "That needs administrator rights, so you will be asked for your password.")
+            btn = Gtk.Button(label="Start monitoring")
+            btn.add_css_class("pill")
+            btn.add_css_class("suggested-action")
+            btn.connect("clicked", lambda *_: self.start())
+            box.append(btn)
+        elif which == "waiting":
+            page.set_paintable(None)
+            page.set_child(Adw.Spinner(width_request=48, height_request=48))
+            page.set_title("Waiting for authorization…")
+            page.set_description("Enter your password in the dialog to start monitoring.")
+            return page
+        else:
+            page.set_icon_name("dialog-warning-symbolic")
+            page.set_title("Monitoring stopped")
+            btn = Gtk.Button(label="Try again")
+            btn.add_css_class("pill")
+            btn.add_css_class("suggested-action")
+            btn.connect("clicked", lambda *_: self.start())
+            box.append(btn)
+            self.error_details = Gtk.Label(wrap=True, selectable=True, max_width_chars=70, xalign=0)
+            self.error_details.add_css_class("monospace")
+            self.error_details.add_css_class("dim-label")
+            box.append(self.error_details)
+            self.error_page = page
+        page.set_child(box)
+        return page
+
+    def _show(self, page):
+        self.stack.set_visible_child_name(page)
+        live = page == "main"
+        for w in self.header_controls:
+            w.set_sensitive(live)
+        self.header.set_title_widget(self.switcher if live else self.title)
+        if not live:                     # no capture now: no capture warnings, no interface names
+            self.banner.set_revealed(False)
+            self.last_drop_at = -1e9
+            self.ifaces = []
+            self.caption.set_text("")
+            self.hs_page.set_badge_number(0)
+
+    # helper lifecycle ------------------------------------------------------
+    def start(self):
+        if self.client is not None:
+            return
+        if self.options.demo:
+            self.client = DemoSource(self.on_message)
+            return
+        if self.options.helper_cmd:
+            argv = shlex.split(self.options.helper_cmd)
+        elif not os.path.exists(HELPER):
+            self.fail("Netwatch is not installed",
+                      "The helper is missing from %s.\nRun install.sh from the Netwatch folder: sudo ./install.sh" % HELPER)
+            return
+        else:
+            argv = ["pkexec", HELPER]
+        argv += ["--json", "--interval", "1"]
+        try:
+            self.client = HelperClient(argv, self.on_message, self.on_exit)
+        except GLib.Error as e:
+            self.fail("Could not start the helper", e.message)
+            return
+        self._show("waiting")
+
+    def stop(self):
+        if self.client is not None:
+            self.client.stop()
+            self.client = None
+
+    def on_exit(self, status, stderr, last_error):
+        self.client = None
+        if status == 0:
+            self._show("start")
+        elif status == 126:                   # pkexec: the password dialog was dismissed
+            self._show("start")
+        elif status == 127 and not last_error:
+            if "authentication agent" in stderr.lower():
+                self.fail("No password dialog available",
+                          "pkexec found no polkit authentication agent in this session, so it could not ask "
+                          "for your password. GNOME and KDE have one; on other desktops start one "
+                          "(e.g. polkit-gnome or lxpolkit).\n\n" + stderr)
+            else:
+                self.fail("Not authorized", stderr or "Monitoring other applications needs an administrator password.")
+        else:
+            self.fail("Monitoring stopped", last_error or stderr or "The helper exited with status %s." % status)
+
+    def fail(self, title, details):
+        self.error_page.set_title(title)
+        self.error_details.set_text(details)
+        self._show("error")
+
+    # incoming reports ------------------------------------------------------
+    def on_message(self, msg):
+        kind = msg.get("type")
+        if kind == "hello":
+            if msg.get("protocol") != PROTOCOL:
+                self.stop()
+                self.fail("Version mismatch", "The installed helper speaks protocol %s; this window expects %s. "
+                          "Run install.sh again." % (msg.get("protocol"), PROTOCOL))
+                return
+            self.ifaces = msg.get("ifaces", [])
+            self._update_title()
+            self._show("main")
+        elif kind == "tick":
+            self.on_tick(msg)
+            self.on_hotspot(msg.get("hotspot"))
+
+    def on_tick(self, msg):
+        now = time.monotonic()
+        dt = max(float(msg.get("dt") or 1.0), 0.05)
+        self.last_dt = dt
+        self.ifaces = msg.get("ifaces", self.ifaces)
+        rx_rate, tx_rate = msg["rx"] / dt, msg["tx"] / dt
+        self.total_rx += msg["rx"]
+        self.total_tx += msg["tx"]
+        self.peak_rx = max(self.peak_rx, rx_rate)
+        self.peak_tx = max(self.peak_tx, tx_rate)
+        self.hist_rx.append(rx_rate)
+        self.hist_tx.append(tx_rate)
+        if msg.get("drops"):
+            self.last_drop_at = now
+
+        for e in self.apps.values():
+            e.rx = e.tx = 0.0
+        for e in self.pids.values():
+            e.rx = e.tx = 0.0
+        metas = msg.get("apps", {})
+        for p in msg.get("procs", []):
+            key = p["app"]
+            meta = metas.get(key, {})
+            app = self.apps.get(key)
+            if app is None:
+                app = self.apps[key] = Entry(key, meta.get("kind", "process"), meta.get("label", key),
+                                             meta.get("app_id"), meta.get("desc"))
+                self._identify(app)
+            app.add(p["rx"], p["tx"], dt, now)
+            if p["pid"]:
+                # a process is (pid, start time): a recycled pid is somebody else
+                ident = (p["pid"], p.get("start", 0))
+                info = app.procs.get(ident)
+                if info is None:
+                    info = app.procs[ident] = {"pid": p["pid"], "comm": p["comm"], "cmd": p["cmd"],
+                                               "user": p["user"], "via": p.get("via"), "rx": 0, "tx": 0}
+                info["rx"] += p["rx"]
+                info["tx"] += p["tx"]
+                info["last"] = now
+                if p.get("via"):
+                    app.via = p["via"]
+                pkey = "pid:%d:%d" % ident
+                pe = self.pids.get(pkey)
+                if pe is None or pe.app_key != key:
+                    if pe is not None:
+                        self._drop_row(pe)           # never leave a row nobody updates
+                    pe = self.pids[pkey] = Entry(pkey, "pid", p["comm"] or app.label, app.app_id, app.desc)
+                    pe.app_key, pe.pid, pe.cmd, pe.via = key, p["pid"], p["cmd"], p.get("via")
+                    pe.display, pe.icon = p["comm"] or app.display, app.icon
+                    pe.procs = {ident: info}
+                pe.add(p["rx"], p["tx"], dt, now)
+            else:
+                pe = self.pids.get(key)          # "other" buckets appear in both views
+                if pe is None:
+                    pe = self.pids[key] = Entry(key, app.kind, app.label, None, app.desc)
+                    pe.display = app.display
+                pe.add(p["rx"], p["tx"], dt, now)
+        self._forget(now)
+        if not self.paused:
+            self.refresh()
+
+    def _drop_row(self, e):
+        if e.row is not None and e.row.get_parent() is self.list:
+            self.list.remove(e.row)
+
+    def _forget(self, now):
+        """Keep a long session bounded: anyone on this computer can start
+        programs with new names, and every one of them would be a row forever."""
+        for pkey in [k for k, e in self.pids.items() if e.pid and now - e.last_active > FORGET_PROCESS_AFTER]:
+            self._drop_row(self.pids.pop(pkey))
+        for app in self.apps.values():
+            if len(app.procs) > MAX_PROCS_PER_APP:
+                keep = sorted(app.procs.items(), key=lambda kv: -kv[1]["last"])[:MAX_PROCS_PER_APP]
+                app.procs = dict(keep)
+        programs = [e for e in self.apps.values() if e.kind != "other"]
+        if len(programs) > MAX_APP_ROWS:
+            quiet = sorted((e for e in programs if e.idle(now)), key=lambda e: e.rx_total + e.tx_total)
+            earlier = self.apps.get("other:earlier")
+            if earlier is None:
+                earlier = self.apps["other:earlier"] = Entry(
+                    "other:earlier", "other", "Earlier programs", None,
+                    "Programs that moved a little traffic earlier this session, folded together to keep the list short")
+            for e in quiet[:len(programs) - MAX_APP_ROWS + 20]:
+                earlier.rx_total += e.rx_total
+                earlier.tx_total += e.tx_total
+                earlier.last_active = max(earlier.last_active, e.last_active)
+                self._drop_row(self.apps.pop(e.key))
+
+    def _identify(self, e):
+        """Desktop name and icon for an application entry."""
+        program = e.label if e.kind == "process" else None
+        name, icon = self.directory.lookup(e.app_id, program)
+        if e.kind == "other":
+            e.display = e.label
+        elif e.kind in ("service", "user-service"):
+            e.display = e.label
+        else:
+            e.display = name or e.label
+        e.icon = icon
+
+    # view -------------------------------------------------------------------
+    def entries(self):
+        return self.apps if self.group == "app" else self.pids
+
+    def refresh(self):
+        now = time.monotonic()
+        entries = self.entries()
+        current = sum(e.rx + e.tx for e in entries.values()) or 1.0
+        for e in entries.values():
+            if e.row is None:
+                e.row = AppRow(self, e)
+            if e.row.get_parent() is None:
+                self.list.append(e.row)
+            e.row.update(self, now, (e.rx + e.tx) / current)
+        if not self.hovering:            # re-sorting under the pointer would move the row being clicked
+            self.list.invalidate_sort()
+        self.list.invalidate_filter()
+
+        bits = self.bits
+        self.down.rate.set_text(fmt_rate(self.hist_rx[-1] if self.hist_rx else 0, bits))
+        self.up.rate.set_text(fmt_rate(self.hist_tx[-1] if self.hist_tx else 0, bits))
+        self.down.detail.set_text("Session %s  ·  peak %s" % (fmt_bytes(self.total_rx), fmt_rate(self.peak_rx, bits)))
+        self.up.detail.set_text("Session %s  ·  peak %s" % (fmt_bytes(self.total_tx), fmt_rate(self.peak_tx, bits)))
+        self.down.graph.set_values(self.hist_rx)
+        self.up.graph.set_values(self.hist_tx)
+        self._update_banner(now)
+        self._update_title()
+
+    def _update_title(self):
+        up = [i["name"] for i in self.ifaces if i.get("uplink")]
+        vpn = [i["name"] for i in self.ifaces if i.get("kind") == "vpn"]
+        parts = ["Measured on " + (", ".join(up) or "no network")]
+        if vpn:
+            parts.append("VPN " + ", ".join(vpn))
+        if self.paused:
+            parts.append("paused")
+        self.caption.set_text("  ·  ".join(parts))
+        self.title.set_subtitle("paused" if self.paused else "")
+
+    def _update_banner(self, now):
+        vpn = [i["name"] for i in self.ifaces if i.get("kind") == "vpn"]
+        if now - self.last_drop_at < 10:
+            text = "The capture is overloaded and missed some packets — per-app numbers are a little low"
+        elif vpn:
+            text = ("VPN active (%s): traffic inside the tunnel is shown under each app, and the same "
+                    "bytes appear again, encrypted, under the VPN client" % ", ".join(vpn))
+        else:
+            text = None
+        self.banner.set_title(text or "")
+        self.banner.set_revealed(text is not None)
+
+    def subtitle(self, e):
+        if e.kind == "pid":
+            parts = ["pid %d" % e.pid]
+            app = self.apps.get(e.app_key)
+            if app is not None and app.display != e.display:
+                parts.append(app.display)
+            if e.cmd:
+                parts.append(e.cmd)
+            return "  ·  ".join(parts)
+        if e.kind == "other":
+            return e.desc or ""
+        parts = []
+        if PROXY_CLIENT.search((e.label or "").lower()) or PROXY_CLIENT.search((e.display or "").lower()):
+            parts.append("Proxy/VPN client — apps that use it are counted here")
+        elif e.desc:
+            parts.append(e.desc)
+        if e.kind == "process" and e.via:
+            via_name, _ = self.directory.lookup(e.via, None)
+            parts.append("started from " + (via_name or e.via))
+        now = time.monotonic()
+        live = [i for i in e.procs.values() if now - i["last"] < IDLE_AFTER] or list(e.procs.values())
+        if len(live) == 1:
+            info = live[0]
+            parts.append(info["cmd"] if e.kind == "process" else "%s, pid %d" % (info["comm"], info["pid"]))
+        elif live:
+            parts.append("%d processes" % len(live))
+        if not parts:
+            parts.append(KIND_NAMES.get(e.kind, ""))
+        return "  ·  ".join(parts)
+
+    def _sort(self, a, b):
+        ea, eb = a.entry, b.entry
+        k = self.sort_key
+        if k == "name":
+            x, y = ea.display.lower(), eb.display.lower()
+            return (x > y) - (x < y)
+        if k == "activity":
+            va, vb = ea.rx + ea.tx, eb.rx + eb.tx
+        else:
+            va, vb = getattr(ea, k), getattr(eb, k)
+        if va != vb:
+            return -1 if va > vb else 1
+        ta, tb = ea.rx_total + ea.tx_total, eb.rx_total + eb.tx_total
+        if ta != tb:
+            return -1 if ta > tb else 1
+        return (ea.display.lower() > eb.display.lower()) - (ea.display.lower() < eb.display.lower())
+
+    def _filter(self, row):
+        return self.show_idle or not row.entry.idle(time.monotonic())
+
+    def set_sort(self, field):
+        self.sort_key = "activity" if self.sort_key == field else field
+        for f, (button, title) in self.sort_buttons.items():
+            active = f == self.sort_key
+            button.set_label(title + (" ▾" if active and f != "name" else " ▴" if active else ""))
+            if active:
+                button.add_css_class("nw-sorted")
+            else:
+                button.remove_css_class("nw-sorted")
+        self.list.invalidate_sort()
+
+    def reset_totals(self):
+        self.total_rx = self.total_tx = 0
+        self.peak_rx = self.peak_tx = 0.0
+        self.hist_rx.clear()
+        self.hist_tx.clear()
+        for e in list(self.apps.values()) + list(self.pids.values()):
+            e.rx_total = e.tx_total = 0
+            for info in e.procs.values():
+                info["rx"] = info["tx"] = 0
+        self.refresh()
+
+    def show_details(self, e):
+        if e.key == "other:hotspot":
+            self.views.set_visible_child_name("hotspot")
+            return
+        app = self.apps.get(e.app_key, e)
+        dialog = Adw.Dialog(title=e.display, content_width=620, content_height=560)
+        page = Adw.PreferencesPage()
+        about = Adw.PreferencesGroup(title="What this is")
+
+        def row(title, subtitle, selectable=False):
+            r = Adw.ActionRow(title=title, subtitle=subtitle or "—", use_markup=False,
+                              subtitle_selectable=selectable)
+            r.add_css_class("property")
+            about.add(r)
+
+        row("Kind", KIND_NAMES.get(app.kind) or ("Process" if e.kind == "pid" else "Other"))
+        if app.desc:
+            row("Description", app.desc)
+        if app.app_id:
+            row("Application id", app.app_id, True)
+        if app.via:
+            via_name, _ = self.directory.lookup(app.via, None)
+            row("Started from", via_name or app.via)
+        row("This session", "↓ %s   ↑ %s" % (fmt_bytes(e.rx_total), fmt_bytes(e.tx_total)))
+        page.add(about)
+
+        procs = Adw.PreferencesGroup(title="Processes")
+        shown = e.procs if e.kind == "pid" else app.procs
+        if not shown:
+            procs.set_description("No single process — this row collects traffic Netwatch could not "
+                                  "pin on a running program.")
+        ranked = sorted(shown.values(), key=lambda info: -(info["rx"] + info["tx"]))
+        if len(ranked) > DETAIL_ROWS:
+            procs.set_description("The %d busiest of %d processes" % (DETAIL_ROWS, len(ranked)))
+        for info in ranked[:DETAIL_ROWS]:
+            r = Adw.ActionRow(title="%s  (pid %d, %s)" % (info["comm"], info["pid"], info["user"]),
+                              subtitle=info["cmd"], use_markup=False, subtitle_selectable=True,
+                              subtitle_lines=3)
+            total = Gtk.Label(label="↓ %s\n↑ %s" % (fmt_bytes(info["rx"]), fmt_bytes(info["tx"])), xalign=1)
+            total.add_css_class("numeric")
+            total.add_css_class("dim-label")
+            r.add_suffix(total)
+            procs.add(r)
+        page.add(procs)
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        view.set_content(page)
+        dialog.set_child(view)
+        dialog.present(self)
+
+    # actions ----------------------------------------------------------------
+    def _on_group(self, action, value):
+        action.set_state(value)
+        self.group = value.get_string()
+        self.list.remove_all()
+        self.refresh()
+
+    def _on_units(self, action, value):
+        action.set_state(value)
+        self.bits = value.get_string() == "bits"
+        self.refresh()
+        self.on_hotspot(self.hotspot)
+
+    def _on_show_idle(self, action, value):
+        action.set_state(value)
+        self.show_idle = value.get_boolean()
+        self.list.invalidate_filter()
+
+    def _on_pause(self, action, value):
+        action.set_state(value)
+        self.paused = value.get_boolean()
+        self.pause_button.set_icon_name("media-playback-start-symbolic" if self.paused
+                                        else "media-playback-pause-symbolic")
+        self._update_title()
+        if not self.paused:
+            self.refresh()
+
+    def _on_close(self, *_):
+        self.stop()
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self, options):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE if options.demo
+                         else Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.options = options
+        self.window = None
+        for name, accels, handler in (("quit", ["<Control>q"], lambda *_: self.quit()),
+                                      ("about", [], lambda *_: self.about())):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", handler)
+            self.add_action(act)
+            if accels:
+                self.set_accels_for_action("app." + name, accels)
+        self.set_accels_for_action("win.reset", ["<Control>r"])
+        self.set_accels_for_action("win.pause", ["<Control>p"])
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        provider = Gtk.CssProvider()
+        provider.load_from_bytes(GLib.Bytes.new(CSS))
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        if self.window is None:
+            self.window = Window(self, self.options)
+            self.window.present()
+            self.window.start()          # straight to the password dialog
+        else:
+            self.window.present()
+
+    def do_shutdown(self):
+        if self.window is not None:
+            self.window.stop()
+        Adw.Application.do_shutdown(self)
+
+    def about(self):
+        Adw.AboutDialog(application_name="Netwatch", application_icon=APP_ID, version=VERSION,
+                        comments="Which application is using the network, right now.",
+                        license_type=Gtk.License.MIT_X11).present(self.window)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="netwatch", description="Live network usage per application.")
+    ap.add_argument("--demo", action="store_true", help="show made-up traffic (no root needed)")
+    ap.add_argument("--helper-cmd", help="command that runs the helper instead of pkexec (for development)")
+    ap.add_argument("--version", action="version", version="netwatch " + VERSION)
+    options, gtk_args = ap.parse_known_args()
+    app = App(options)
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except (ValueError, ImportError, AttributeError):
+        signal_add = GLib.unix_signal_add
+    signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, lambda: (app.quit(), False)[1])
+    return app.run([sys.argv[0]] + gtk_args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

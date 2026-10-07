@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3d8ff0"/>
+      <stop offset="1" stop-color="#1a5fb4"/>
+    </linearGradient>
+    <linearGradient id="shade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0.18"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="12" width="112" height="108" rx="24" fill="#123f78"/>
+  <rect x="8" y="8" width="112" height="108" rx="24" fill="url(#bg)"/>
+  <!-- traffic graph -->
+  <path d="M20 86 L34 80 L44 84 L54 64 L64 70 L74 50 L84 58 L94 44 L108 48 L108 104 L20 104 Z"
+        fill="#ffffff" fill-opacity="0.16"/>
+  <path d="M20 86 L34 80 L44 84 L54 64 L64 70 L74 50 L84 58 L94 44 L108 48"
+        fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- download arrow -->
+  <path d="M46 26 v30 m-12 -12 l12 13 l12 -13" fill="none" stroke="#ffffff" stroke-width="9"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- upload arrow -->
+  <path d="M82 60 v-30 m-12 12 l12 -13 l12 13" fill="none" stroke="#ffa348" stroke-width="9"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="8" y="8" width="112" height="108" rx="24" fill="url(#shade)"/>
+</svg>
